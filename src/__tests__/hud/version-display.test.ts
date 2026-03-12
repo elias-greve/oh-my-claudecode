@@ -6,7 +6,7 @@ import type { HudRenderContext, HudConfig } from '../../hud/types.js';
 function createMinimalContext(overrides: Partial<HudRenderContext> = {}): HudRenderContext {
   return {
     contextPercent: 30,
-    modelName: 'claude-sonnet-4.5',
+    modelName: 'claude-sonnet-4.6',
     ralph: null,
     ultrawork: null,
     prd: null,
@@ -16,12 +16,19 @@ function createMinimalContext(overrides: Partial<HudRenderContext> = {}): HudRen
     backgroundTasks: [],
     cwd: '/tmp/test',
     lastSkill: null,
-    rateLimits: null,
+    rateLimitsResult: null,
+    customBuckets: null,
     pendingPermission: null,
     thinkingState: null,
     sessionHealth: null,
     omcVersion: null,
     updateAvailable: null,
+    toolCallCount: 0,
+    agentCallCount: 0,
+    skillCallCount: 0,
+    promptTime: null,
+    apiKeySource: null,
+    profileName: null,
     ...overrides,
   };
 }

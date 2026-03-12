@@ -23,6 +23,14 @@ export interface HookOutput {
         };
     };
 }
+export declare function getClaudePermissionAllowEntries(directory: string): string[];
+export declare function hasClaudePermissionApproval(directory: string, toolName: 'Edit' | 'Write' | 'Bash', command?: string): boolean;
+export interface BackgroundPermissionFallbackResult {
+    shouldFallback: boolean;
+    missingTools: string[];
+}
+export declare function getBackgroundTaskPermissionFallback(directory: string, subagentType?: string): BackgroundPermissionFallbackResult;
+export declare function getBackgroundBashPermissionFallback(directory: string, command?: string): BackgroundPermissionFallbackResult;
 /**
  * Check if a command matches safe patterns
  */
@@ -40,7 +48,7 @@ export declare function isSafeCommand(command: string): boolean;
  */
 export declare function isHeredocWithSafeBase(command: string): boolean;
 /**
- * Check if an active mode (autopilot/ultrawork/ralph/swarm) is running
+ * Check if an active mode (autopilot/ultrawork/ralph/team) is running
  */
 export declare function isActiveModeRunning(directory: string): boolean;
 /**

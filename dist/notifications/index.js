@@ -9,14 +9,20 @@
  *   import { notify } from '../notifications/index.js';
  *   await notify('session-start', { sessionId, projectPath, ... });
  */
-export { dispatchNotifications, sendDiscord, sendDiscordBot, sendTelegram, sendSlack, sendWebhook, } from "./dispatcher.js";
-export { formatNotification, formatSessionStart, formatSessionStop, formatSessionEnd, formatSessionIdle, formatAskUserQuestion, } from "./formatter.js";
-export { getCurrentTmuxSession, getTeamTmuxSessions, formatTmuxInfo, } from "./tmux.js";
-export { getNotificationConfig, isEventEnabled, getEnabledPlatforms, } from "./config.js";
-import { getNotificationConfig, isEventEnabled } from "./config.js";
+export { dispatchNotifications, sendDiscord, sendDiscordBot, sendTelegram, sendSlack, sendSlackBot, sendWebhook, } from "./dispatcher.js";
+export { formatNotification, formatSessionStart, formatSessionStop, formatSessionEnd, formatSessionIdle, formatAskUserQuestion, formatAgentCall, } from "./formatter.js";
+export { getCurrentTmuxSession, getCurrentTmuxPaneId, getTeamTmuxSessions, formatTmuxInfo, } from "./tmux.js";
+export { getNotificationConfig, isEventEnabled, getEnabledPlatforms, getVerbosity, getTmuxTailLines, isEventAllowedByVerbosity, shouldIncludeTmuxTail, } from "./config.js";
+export { getHookConfig, resolveEventTemplate, resetHookConfigCache, mergeHookConfigIntoNotificationConfig, } from "./hook-config.js";
+export { interpolateTemplate, getDefaultTemplate, validateTemplate, computeTemplateVariables, } from "./template-engine.js";
+export { verifySlackSignature, isTimestampValid, validateSlackEnvelope, validateSlackMessage, SlackConnectionStateTracker, } from "./slack-socket.js";
+export { redactTokens } from "./redact.js";
+import { getNotificationConfig, isEventEnabled, getVerbosity, getTmuxTailLines, isEventAllowedByVerbosity, shouldIncludeTmuxTail, } from "./config.js";
 import { formatNotification } from "./formatter.js";
 import { dispatchNotifications } from "./dispatcher.js";
 import { getCurrentTmuxSession } from "./tmux.js";
+import { getHookConfig, resolveEventTemplate } from "./hook-config.js";
+import { interpolateTemplate } from "./template-engine.js";
 import { basename } from "path";
 /**
  * High-level notification function.
@@ -29,11 +35,22 @@ import { basename } from "path";
  * @returns DispatchResult or null if notifications are not configured/enabled
  */
 export async function notify(event, data) {
+    // OMC_NOTIFY=0 suppresses all CCNotifier events (set by `omc --notify false`)
+    if (process.env.OMC_NOTIFY === '0') {
+        return null;
+    }
     try {
-        const config = getNotificationConfig();
+        const config = getNotificationConfig(data.profileName);
         if (!config || !isEventEnabled(config, event)) {
             return null;
         }
+        // Verbosity filter (second gate after isEventEnabled)
+        const verbosity = getVerbosity(config);
+        if (!isEventAllowedByVerbosity(verbosity, event)) {
+            return null;
+        }
+        // Get tmux pane ID
+        const { getCurrentTmuxPaneId } = await import("./tmux.js");
         // Build the full payload
         const payload = {
             event,
@@ -41,6 +58,7 @@ export async function notify(event, data) {
             message: "", // Will be formatted below
             timestamp: data.timestamp || new Date().toISOString(),
             tmuxSession: data.tmuxSession ?? getCurrentTmuxSession() ?? undefined,
+            tmuxPaneId: data.tmuxPaneId ?? getCurrentTmuxPaneId() ?? undefined,
             projectPath: data.projectPath,
             projectName: data.projectName ||
                 (data.projectPath ? basename(data.projectPath) : undefined),
@@ -55,11 +73,83 @@ export async function notify(event, data) {
             maxIterations: data.maxIterations,
             question: data.question,
             incompleteTasks: data.incompleteTasks,
+            agentName: data.agentName,
+            agentType: data.agentType,
+            replyChannel: data.replyChannel ?? process.env.OPENCLAW_REPLY_CHANNEL ?? undefined,
+            replyTarget: data.replyTarget ?? process.env.OPENCLAW_REPLY_TARGET ?? undefined,
+            replyThread: data.replyThread ?? process.env.OPENCLAW_REPLY_THREAD ?? undefined,
         };
-        // Format the message
-        payload.message = data.message || formatNotification(payload);
+        // Capture tmux tail for events that benefit from it
+        if (shouldIncludeTmuxTail(verbosity) &&
+            payload.tmuxPaneId &&
+            (event === "session-idle" || event === "session-end" || event === "session-stop")) {
+            try {
+                const { capturePaneContent } = await import("../features/rate-limit-wait/tmux-detector.js");
+                const tailLines = getTmuxTailLines(config);
+                const tail = capturePaneContent(payload.tmuxPaneId, tailLines);
+                if (tail) {
+                    payload.tmuxTail = tail;
+                    payload.maxTailLines = tailLines;
+                }
+            }
+            catch {
+                // Non-blocking: tmux capture is best-effort
+            }
+        }
+        // Format the message (default for all platforms)
+        const defaultMessage = data.message || formatNotification(payload);
+        payload.message = defaultMessage;
+        // Per-platform template resolution (only when hook config has overrides)
+        let platformMessages;
+        if (!data.message) {
+            const hookConfig = getHookConfig();
+            if (hookConfig?.enabled) {
+                const platforms = [
+                    "discord", "discord-bot", "telegram", "slack", "slack-bot", "webhook",
+                ];
+                const map = new Map();
+                for (const platform of platforms) {
+                    const template = resolveEventTemplate(hookConfig, event, platform);
+                    if (template) {
+                        const resolved = interpolateTemplate(template, payload);
+                        if (resolved !== defaultMessage) {
+                            map.set(platform, resolved);
+                        }
+                    }
+                }
+                if (map.size > 0) {
+                    platformMessages = map;
+                }
+            }
+        }
         // Dispatch to all enabled platforms
-        return await dispatchNotifications(config, event, payload);
+        const result = await dispatchNotifications(config, event, payload, platformMessages);
+        // NEW: Register message IDs for reply correlation
+        if (result.anySuccess && payload.tmuxPaneId) {
+            try {
+                const { registerMessage } = await import("./session-registry.js");
+                for (const r of result.results) {
+                    if (r.success &&
+                        r.messageId &&
+                        (r.platform === "discord-bot" || r.platform === "telegram" || r.platform === "slack-bot")) {
+                        registerMessage({
+                            platform: r.platform,
+                            messageId: r.messageId,
+                            sessionId: payload.sessionId,
+                            tmuxPaneId: payload.tmuxPaneId,
+                            tmuxSessionName: payload.tmuxSession || "",
+                            event: payload.event,
+                            createdAt: new Date().toISOString(),
+                            projectPath: payload.projectPath,
+                        });
+                    }
+                }
+            }
+            catch {
+                // Non-fatal: reply correlation is best-effort
+            }
+        }
+        return result;
     }
     catch (error) {
         // Never let notification failures propagate to hooks
@@ -67,4 +157,9 @@ export async function notify(event, data) {
         return null;
     }
 }
+export { sendCustomWebhook, sendCustomCli, dispatchCustomIntegrations, } from "./dispatcher.js";
+export { getCustomIntegrationsConfig, getCustomIntegrationsForEvent, hasCustomIntegrationsEnabled, detectLegacyOpenClawConfig, migrateLegacyOpenClawConfig, } from "./config.js";
+export { CUSTOM_INTEGRATION_PRESETS, getPresetList, getPreset, isValidPreset, } from "./presets.js";
+export { TEMPLATE_VARIABLES, getVariablesForEvent, getVariableDocumentation, } from "./template-variables.js";
+export { validateCustomIntegration, checkDuplicateIds, sanitizeArgument, } from "./validation.js";
 //# sourceMappingURL=index.js.map

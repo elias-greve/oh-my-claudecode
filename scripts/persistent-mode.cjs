@@ -5,7 +5,7 @@
  * Minimal continuation enforcer for all OMC modes.
  * Stripped down for reliability — no optional imports, no PRD, no notepad pruning.
  *
- * Supported modes: ralph, autopilot, ultrapilot, swarm, ultrawork, ecomode, ultraqa, pipeline
+ * Supported modes: ralph, autopilot, ultrapilot, swarm, ultrawork, ultraqa, pipeline, team
  */
 
 const {
@@ -14,11 +14,12 @@ const {
   writeFileSync,
   readdirSync,
   mkdirSync,
+  unlinkSync,
 } = require("fs");
 const { join, dirname, resolve, normalize } = require("path");
 const { homedir } = require("os");
 
-async function readStdin(timeoutMs = 5000) {
+async function readStdin(timeoutMs = 2000) {
   return new Promise((resolve) => {
     const chunks = [];
     let settled = false;
@@ -53,6 +54,43 @@ function writeJsonFile(path, data) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Read the session-idle notification cooldown in seconds from ~/.omc/config.json.
+ * Default: 60. 0 = disabled.
+ */
+function getIdleCooldownSeconds() {
+  const configPath = join(homedir(), '.omc', 'config.json');
+  const config = readJsonFile(configPath);
+  const val = config?.notificationCooldown?.sessionIdleSeconds;
+  if (typeof val === 'number') return val;
+  return 60;
+}
+
+/**
+ * Check whether the session-idle cooldown has elapsed.
+ * Returns true if the notification should be sent.
+ */
+function shouldSendIdleNotification(stateDir) {
+  const cooldownSecs = getIdleCooldownSeconds();
+  if (cooldownSecs === 0) return true; // cooldown disabled
+
+  const cooldownPath = join(stateDir, 'idle-notif-cooldown.json');
+  const data = readJsonFile(cooldownPath);
+  if (data?.lastSentAt) {
+    const elapsed = (Date.now() - new Date(data.lastSentAt).getTime()) / 1000;
+    if (Number.isFinite(elapsed) && elapsed < cooldownSecs) return false;
+  }
+  return true;
+}
+
+/**
+ * Record that the session-idle notification was sent.
+ */
+function recordIdleNotificationSent(stateDir) {
+  const cooldownPath = join(stateDir, 'idle-notif-cooldown.json');
+  writeJsonFile(cooldownPath, { lastSentAt: new Date().toISOString() });
 }
 
 /**
@@ -93,6 +131,35 @@ async function sendStopNotification(modeName, stateData, sessionId, directory) {
  */
 const STALE_STATE_THRESHOLD_MS = 2 * 60 * 60 * 1000; // 2 hours
 
+// Stop breaker constants for first-class mode enforcement
+const TEAM_PIPELINE_STOP_BLOCKER_MAX = 20;
+const TEAM_PIPELINE_STOP_BLOCKER_TTL_MS = 5 * 60 * 1000; // 5 min
+const RALPLAN_STOP_BLOCKER_MAX = 30;
+const RALPLAN_STOP_BLOCKER_TTL_MS = 45 * 60 * 1000; // 45 min
+const TEAM_TERMINAL_PHASES = new Set([
+  "completed",
+  "complete",
+  "failed",
+  "cancelled",
+  "canceled",
+  "aborted",
+  "terminated",
+  "done",
+]);
+const TEAM_ACTIVE_PHASES = new Set([
+  "team-plan",
+  "team-prd",
+  "team-exec",
+  "team-verify",
+  "team-fix",
+  "planning",
+  "executing",
+  "verify",
+  "verification",
+  "fix",
+  "fixing",
+]);
+
 /**
  * Check if a state is stale based on its timestamps.
  * A state is considered stale if it hasn't been updated recently.
@@ -111,6 +178,98 @@ function isStaleState(state) {
 
   const age = Date.now() - mostRecent;
   return age > STALE_STATE_THRESHOLD_MS;
+}
+
+function normalizeTeamPhase(state) {
+  if (!state || typeof state !== "object") return null;
+
+  const rawPhase = state.current_phase ?? state.phase ?? state.stage;
+  if (typeof rawPhase !== "string") return null;
+
+  const phase = rawPhase.trim().toLowerCase();
+  if (!phase || TEAM_TERMINAL_PHASES.has(phase)) return null;
+  return TEAM_ACTIVE_PHASES.has(phase) ? phase : null;
+}
+
+function getSafeReinforcementCount(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : 0;
+}
+
+// ---------------------------------------------------------------------------
+// Stop Breaker helpers (shared by team pipeline and ralplan)
+// ---------------------------------------------------------------------------
+
+function readStopBreaker(stateDir, name, sessionId, ttlMs) {
+  const dir = sessionId
+    ? join(stateDir, "sessions", sessionId)
+    : stateDir;
+  const breakerPath = join(dir, `${name}-stop-breaker.json`);
+
+  try {
+    if (!existsSync(breakerPath)) return 0;
+    const raw = JSON.parse(readFileSync(breakerPath, "utf-8"));
+    if (ttlMs && raw.updated_at) {
+      const updatedAt = new Date(raw.updated_at).getTime();
+      if (Number.isFinite(updatedAt) && Date.now() - updatedAt > ttlMs) {
+        unlinkSync(breakerPath);
+        return 0;
+      }
+    }
+    return typeof raw.count === "number" ? raw.count : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeStopBreaker(stateDir, name, count, sessionId) {
+  const dir = sessionId
+    ? join(stateDir, "sessions", sessionId)
+    : stateDir;
+
+  try {
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const breakerPath = join(dir, `${name}-stop-breaker.json`);
+    writeJsonFile(breakerPath, { count, updated_at: new Date().toISOString() });
+  } catch {
+    // Fail-open
+  }
+}
+
+/**
+ * Check if a cancel signal is in progress for the session.
+ * Cancel signals are written by state_clear and expire after 30 seconds.
+ * @param {string} stateDir - The .omc/state directory path
+ * @param {string} sessionId - Optional session ID
+ * @returns {boolean} true if cancel is in progress
+ */
+function isSessionCancelInProgress(stateDir, sessionId) {
+  const CANCEL_SIGNAL_TTL_MS = 30000; // 30 seconds
+
+  // Try session-scoped path first
+  if (sessionId) {
+    const sessionSignalPath = join(stateDir, 'sessions', sessionId, 'cancel-signal-state.json');
+    const signal = readJsonFile(sessionSignalPath);
+    if (signal && signal.expires_at) {
+      const expiresAt = new Date(signal.expires_at).getTime();
+      if (Date.now() < expiresAt) {
+        return true;
+      }
+    }
+  }
+
+  // Fall back to legacy path
+  const legacySignalPath = join(stateDir, 'cancel-signal-state.json');
+  const signal = readJsonFile(legacySignalPath);
+  if (signal && signal.expires_at) {
+    const expiresAt = new Date(signal.expires_at).getTime();
+    if (Date.now() < expiresAt) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -183,7 +342,26 @@ function readStateFileWithSession(stateDir, filename, sessionId) {
     if (state) {
       return { state, path: sessionPath, isGlobal: false };
     }
-    // Session path not found — do NOT fall back to legacy
+    // Session path not found — fallback: scan ALL session dirs for a state
+    // whose session_id matches ours (handles path mismatches)
+    try {
+      const allSessionsDir = join(stateDir, 'sessions');
+      if (existsSync(allSessionsDir)) {
+        const dirs = readdirSync(allSessionsDir).filter(d => /^[a-zA-Z0-9]/.test(d));
+        for (const dir of dirs) {
+          const candidatePath = join(allSessionsDir, dir, filename);
+          const candidateState = readJsonFile(candidatePath);
+          if (candidateState && candidateState.session_id === sessionId) {
+            return { state: candidateState, path: candidatePath, isGlobal: false };
+          }
+        }
+      }
+    } catch { /* ignore scan errors */ }
+    // Also check legacy path if its session_id matches
+    const legacyResult = readStateFile(stateDir, filename);
+    if (legacyResult.state && legacyResult.state.session_id === sessionId) {
+      return legacyResult;
+    }
     return { state: null, path: null, isGlobal: false };
   }
   // No sessionId: fall back to legacy path (backward compat)
@@ -283,7 +461,15 @@ function countIncompleteTodos(sessionId, projectDir) {
  * See: https://github.com/Yeachan-Heo/oh-my-claudecode/issues/213
  */
 function isContextLimitStop(data) {
-  const reason = (data.stop_reason || data.stopReason || "").toLowerCase();
+  const reasons = [
+    data.stop_reason,
+    data.stopReason,
+    data.end_turn_reason,
+    data.endTurnReason,
+    data.reason,
+  ]
+    .filter((value) => typeof value === "string" && value.trim().length > 0)
+    .map((value) => value.toLowerCase().replace(/[\s-]+/g, "_"));
 
   const contextPatterns = [
     "context_limit",
@@ -297,20 +483,27 @@ function isContextLimitStop(data) {
     "input_too_long",
   ];
 
-  if (contextPatterns.some((p) => reason.includes(p))) {
-    return true;
-  }
+  return reasons.some((reason) => contextPatterns.some((p) => reason.includes(p)));
+}
 
-  const endTurnReason = (
-    data.end_turn_reason ||
-    data.endTurnReason ||
-    ""
-  ).toLowerCase();
-  if (endTurnReason && contextPatterns.some((p) => endTurnReason.includes(p))) {
-    return true;
-  }
+const CRITICAL_CONTEXT_STOP_PERCENT = 95;
 
-  return false;
+function estimateContextPercent(transcriptPath) {
+  if (!transcriptPath || !existsSync(transcriptPath)) return 0;
+
+  try {
+    const content = readFileSync(transcriptPath, "utf-8");
+    const windowMatch = content.match(/"context_window"\s{0,5}:\s{0,5}(\d+)/g);
+    const inputMatch = content.match(/"input_tokens"\s{0,5}:\s{0,5}(\d+)/g);
+    if (!windowMatch || !inputMatch) return 0;
+
+    const lastWindow = parseInt(windowMatch[windowMatch.length - 1].match(/(\d+)/)[1], 10);
+    const lastInput = parseInt(inputMatch[inputMatch.length - 1].match(/(\d+)/)[1], 10);
+    if (!Number.isFinite(lastWindow) || lastWindow <= 0 || !Number.isFinite(lastInput)) return 0;
+    return Math.round((lastInput / lastWindow) * 100);
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -336,6 +529,38 @@ function isUserAbort(data) {
   );
 }
 
+const AUTHENTICATION_ERROR_PATTERNS = [
+  "authentication_error",
+  "authentication_failed",
+  "auth_error",
+  "unauthorized",
+  "unauthorised",
+  "401",
+  "403",
+  "forbidden",
+  "invalid_token",
+  "token_invalid",
+  "token_expired",
+  "expired_token",
+  "oauth_expired",
+  "oauth_token_expired",
+  "invalid_grant",
+  "insufficient_scope",
+];
+
+function isAuthenticationError(data) {
+  const reason = (data.stop_reason || data.stopReason || "").toLowerCase();
+  const endTurnReason = (
+    data.end_turn_reason ||
+    data.endTurnReason ||
+    ""
+  ).toLowerCase();
+
+  return AUTHENTICATION_ERROR_PATTERNS.some(
+    (pattern) => reason.includes(pattern) || endTurnReason.includes(pattern),
+  );
+}
+
 async function main() {
   try {
     const input = await readStdin();
@@ -356,8 +581,20 @@ async function main() {
       return;
     }
 
+    const criticalTranscriptPath = data.transcript_path || data.transcriptPath || "";
+    if (estimateContextPercent(criticalTranscriptPath) >= CRITICAL_CONTEXT_STOP_PERCENT) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
     // Respect user abort (Ctrl+C, cancel)
     if (isUserAbort(data)) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
+    // Never block auth failures (401/403/expired OAuth): allow re-auth flow.
+    if (isAuthenticationError(data)) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
       return;
     }
@@ -367,9 +604,11 @@ async function main() {
     const autopilot = readStateFileWithSession(stateDir, "autopilot-state.json", sessionId);
     const ultrapilot = readStateFileWithSession(stateDir, "ultrapilot-state.json", sessionId);
     const ultrawork = readStateFileWithSession(stateDir, "ultrawork-state.json", sessionId);
-    const ecomode = readStateFileWithSession(stateDir, "ecomode-state.json", sessionId);
     const ultraqa = readStateFileWithSession(stateDir, "ultraqa-state.json", sessionId);
     const pipeline = readStateFileWithSession(stateDir, "pipeline-state.json", sessionId);
+    const team = readStateFileWithSession(stateDir, "team-state.json", sessionId);
+    const ralplan = readStateFileWithSession(stateDir, "ralplan-state.json", sessionId);
+    const omcTeams = readStateFileWithSession(stateDir, "omc-teams-state.json", sessionId);
 
     // Swarm uses swarm-summary.json (not swarm-state.json) + marker file
     const swarmMarker = existsSync(join(stateDir, "swarm-active.marker"));
@@ -379,6 +618,14 @@ async function main() {
     const taskCount = countIncompleteTasks(sessionId);
     const todoCount = countIncompleteTodos(sessionId, directory);
     const totalIncomplete = taskCount + todoCount;
+
+    // Check if cancel is in progress - if so, allow stop immediately
+    // Cache the result to pass to sub-checks (avoids TOCTOU re-reads, issue #1058)
+    const cancelInProgress = isSessionCancelInProgress(stateDir, sessionId);
+    if (cancelInProgress) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
 
     // Priority 1: Ralph Loop (explicit persistence mode)
     // Skip if state is stale (older than 2 hours) - prevents blocking new sessions
@@ -396,7 +643,7 @@ async function main() {
 
         console.log(
           JSON.stringify({
-            decision: "block",
+            continue: false, decision: "block",
             reason: `[RALPH LOOP - ITERATION ${iteration + 1}/${maxIter}] Work is NOT done. Continue working.\nWhen FULLY complete (after Architect verification), run /oh-my-claudecode:cancel to cleanly exit ralph mode and clean up all state files. If cancel fails, retry with /oh-my-claudecode:cancel --force.\n${ralph.state.prompt ? `Task: ${ralph.state.prompt}` : ""}`,
           }),
         );
@@ -419,10 +666,106 @@ async function main() {
 
           console.log(
             JSON.stringify({
-              decision: "block",
+              continue: false, decision: "block",
               reason: `[AUTOPILOT - Phase: ${phase}] Autopilot not complete. Continue working. When all phases are complete, run /oh-my-claudecode:cancel to cleanly exit and clean up state files. If cancel fails, retry with /oh-my-claudecode:cancel --force.`,
             }),
           );
+          return;
+        }
+      }
+    }
+
+    // Priority 2.5: Team Pipeline (standalone team mode — first-class enforcement)
+    // When team runs WITHOUT ralph, this provides stop-hook blocking.
+    // When team runs WITH ralph, checkRalphLoop (Priority 1) handles it.
+    let teamPipelineHandled = false;
+    if (team.state && isSessionMatch(team.state, sessionId)) {
+      if (!team.state.active) {
+        // Inactive — reset breaker, allow stop, mark as handled
+        writeStopBreaker(stateDir, "team-pipeline", 0, sessionId);
+        teamPipelineHandled = true;
+      } else if (!isStaleState(team.state)) {
+        teamPipelineHandled = true;
+
+        // Cancel-in-progress bypass (TOCTOU defense, issue #1058)
+        if (!cancelInProgress) {
+          // Read phase: canonical field priority matching bridge code
+          const rawPhase = team.state.phase
+            ?? team.state.current_phase
+            ?? team.state.currentStage
+            ?? team.state.current_stage
+            ?? team.state.stage;
+
+          if (typeof rawPhase !== "string") {
+            // No valid phase — fail-open (don't block)
+          } else {
+            const phase = rawPhase.trim().toLowerCase();
+
+            if (TEAM_TERMINAL_PHASES.has(phase) || phase === "cancel") {
+              // Terminal — reset breaker, allow stop
+              writeStopBreaker(stateDir, "team-pipeline", 0, sessionId);
+            } else if (!TEAM_ACTIVE_PHASES.has(phase)) {
+              // Unknown phase — fail-open (don't block)
+            } else {
+              // Status-level terminal check
+              const rawStatus = team.state.status;
+              const status = typeof rawStatus === "string" ? rawStatus.trim().toLowerCase() : null;
+              if (status && TEAM_TERMINAL_PHASES.has(status)) {
+                writeStopBreaker(stateDir, "team-pipeline", 0, sessionId);
+              } else if (team.state.cancel?.requested) {
+                // Cancel requested — allow stop
+                writeStopBreaker(stateDir, "team-pipeline", 0, sessionId);
+              } else {
+                // Active phase — block with circuit breaker
+                const breakerCount = readStopBreaker(stateDir, "team-pipeline", sessionId, TEAM_PIPELINE_STOP_BLOCKER_TTL_MS) + 1;
+                if (breakerCount > TEAM_PIPELINE_STOP_BLOCKER_MAX) {
+                  writeStopBreaker(stateDir, "team-pipeline", 0, sessionId);
+                  // Circuit breaker tripped — allow stop
+                } else {
+                  writeStopBreaker(stateDir, "team-pipeline", breakerCount, sessionId);
+                  sendStopNotification("team", team.state, sessionId, directory).catch(() => {});
+
+                  console.log(JSON.stringify({
+                    continue: false, decision: "block",
+                    reason: `[TEAM PIPELINE - PHASE: ${phase.toUpperCase()} | REINFORCEMENT ${breakerCount}/${TEAM_PIPELINE_STOP_BLOCKER_MAX}] The team pipeline is active in phase "${phase}". Continue working on the team workflow. Do not stop until the pipeline reaches a terminal state (complete/failed/cancelled). When done, run /oh-my-claudecode:cancel to cleanly exit.`,
+                  }));
+                  return;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Priority 2.6: Ralplan (standalone consensus planning — first-class enforcement)
+    if (ralplan.state?.active && !isStaleState(ralplan.state) && isSessionMatch(ralplan.state, sessionId)) {
+      // Terminal phase detection
+      const currentPhase = ralplan.state.current_phase;
+      let ralplanTerminal = false;
+      if (typeof currentPhase === "string") {
+        const terminal = ["complete", "completed", "failed", "cancelled", "canceled", "done"];
+        if (terminal.includes(currentPhase.toLowerCase())) {
+          writeStopBreaker(stateDir, "ralplan", 0, sessionId);
+          ralplanTerminal = true;
+        }
+      }
+
+      if (!ralplanTerminal && !cancelInProgress) {
+        // Circuit breaker
+        const breakerCount = readStopBreaker(stateDir, "ralplan", sessionId, RALPLAN_STOP_BLOCKER_TTL_MS) + 1;
+        if (breakerCount > RALPLAN_STOP_BLOCKER_MAX) {
+          writeStopBreaker(stateDir, "ralplan", 0, sessionId);
+          // Circuit breaker tripped — allow stop
+        } else {
+          writeStopBreaker(stateDir, "ralplan", breakerCount, sessionId);
+
+          sendStopNotification("ralplan", ralplan.state, sessionId, directory).catch(() => {});
+
+          console.log(JSON.stringify({
+            continue: false, decision: "block",
+            reason: `[RALPLAN - CONSENSUS PLANNING | REINFORCEMENT ${breakerCount}/${RALPLAN_STOP_BLOCKER_MAX}] The ralplan consensus workflow is active. Continue the Planner/Architect/Critic loop. Do not stop until consensus is reached or the workflow completes. When done, run /oh-my-claudecode:cancel to cleanly exit.`,
+          }));
           return;
         }
       }
@@ -446,7 +789,7 @@ async function main() {
 
           console.log(
             JSON.stringify({
-              decision: "block",
+              continue: false, decision: "block",
               reason: `[ULTRAPILOT] ${incomplete} workers still running. Continue working. When all workers complete, run /oh-my-claudecode:cancel to cleanly exit and clean up state files. If cancel fails, retry with /oh-my-claudecode:cancel --force.`,
             }),
           );
@@ -471,7 +814,7 @@ async function main() {
 
           console.log(
             JSON.stringify({
-              decision: "block",
+              continue: false, decision: "block",
               reason: `[SWARM ACTIVE] ${pending} tasks remain. Continue working. When all tasks are done, run /oh-my-claudecode:cancel to cleanly exit and clean up state files. If cancel fails, retry with /oh-my-claudecode:cancel --force.`,
             }),
           );
@@ -496,7 +839,7 @@ async function main() {
 
           console.log(
             JSON.stringify({
-              decision: "block",
+              continue: false, decision: "block",
               reason: `[PIPELINE - Stage ${currentStage + 1}/${totalStages}] Pipeline not complete. Continue working. When all stages complete, run /oh-my-claudecode:cancel to cleanly exit and clean up state files. If cancel fails, retry with /oh-my-claudecode:cancel --force.`,
             }),
           );
@@ -505,7 +848,55 @@ async function main() {
       }
     }
 
-    // Priority 6: UltraQA (QA cycling)
+    // Priority 6: Team (native Claude Code teams) — fallback for cases not handled by Priority 2.5
+    if (!teamPipelineHandled && team.state?.active && !isStaleState(team.state) && isSessionMatch(team.state, sessionId)) {
+      const phase = normalizeTeamPhase(team.state);
+      if (phase) {
+        const newCount = getSafeReinforcementCount(team.state.reinforcement_count) + 1;
+        if (newCount <= 20) {
+          team.state.reinforcement_count = newCount;
+          team.state.last_checked_at = new Date().toISOString();
+          writeJsonFile(team.path, team.state);
+
+          // Fire-and-forget notification
+          sendStopNotification('team', team.state, sessionId, directory).catch(() => {});
+
+          console.log(
+            JSON.stringify({
+              continue: false, decision: "block",
+              reason: `[TEAM - Phase: ${phase}] Team mode active. Continue working. When all team tasks complete, run /oh-my-claudecode:cancel to cleanly exit. If cancel fails, retry with /oh-my-claudecode:cancel --force.`,
+            }),
+          );
+          return;
+        }
+      }
+    }
+
+    // Priority 6.5: OMC Teams (tmux CLI workers — independent of native team state)
+    if (omcTeams.state?.active && !isStaleState(omcTeams.state) && isSessionMatch(omcTeams.state, sessionId)) {
+      const phase = normalizeTeamPhase(omcTeams.state);
+      if (phase) {
+        const newCount = getSafeReinforcementCount(omcTeams.state.reinforcement_count) + 1;
+        if (newCount <= 20) {
+          omcTeams.state.reinforcement_count = newCount;
+          omcTeams.state.last_checked_at = new Date().toISOString();
+          writeJsonFile(omcTeams.path, omcTeams.state);
+
+          // Fire-and-forget notification
+          sendStopNotification('omc-teams', omcTeams.state, sessionId, directory).catch(() => {});
+
+          console.log(
+            JSON.stringify({
+              continue: false, decision: "block",
+              reason: `[OMC TEAMS - Phase: ${phase}] OMC Teams workers active. Continue working. When all workers complete, run /oh-my-claudecode:cancel to cleanly exit. If cancel fails, retry with /oh-my-claudecode:cancel --force.`,
+            }),
+          );
+          return;
+        }
+      }
+    }
+
+    // Priority 7: UltraQA (QA cycling)
     if (ultraqa.state?.active && !isStaleState(ultraqa.state) && isSessionMatch(ultraqa.state, sessionId)) {
       const cycle = ultraqa.state.cycle || 1;
       const maxCycles = ultraqa.state.max_cycles || 10;
@@ -519,7 +910,7 @@ async function main() {
 
         console.log(
           JSON.stringify({
-            decision: "block",
+            continue: false, decision: "block",
             reason: `[ULTRAQA - Cycle ${cycle + 1}/${maxCycles}] Tests not all passing. Continue fixing. When all tests pass, run /oh-my-claudecode:cancel to cleanly exit and clean up state files. If cancel fails, retry with /oh-my-claudecode:cancel --force.`,
           }),
         );
@@ -527,7 +918,7 @@ async function main() {
       }
     }
 
-    // Priority 7: Ultrawork - ALWAYS continue while active (not just when tasks exist)
+    // Priority 8: Ultrawork - ALWAYS continue while active (not just when tasks exist)
     // This prevents false stops from bash errors, transient failures, etc.
     // Session isolation: only block if state belongs to this session (issue #311)
     // Project isolation: only block if state belongs to this project
@@ -541,7 +932,13 @@ async function main() {
       const maxReinforcements = ultrawork.state.max_reinforcements || 50;
 
       if (newCount > maxReinforcements) {
-        // Max reinforcements reached - allow stop
+        try {
+          unlinkSync(ultrawork.path);
+        } catch {
+          ultrawork.state.active = false;
+          ultrawork.state.last_checked_at = new Date().toISOString();
+          writeJsonFile(ultrawork.path, ultrawork.state);
+        }
         console.log(JSON.stringify({ continue: true, suppressOutput: true }));
         return;
       }
@@ -558,61 +955,62 @@ async function main() {
       if (totalIncomplete > 0) {
         const itemType = taskCount > 0 ? "Tasks" : "todos";
         reason += ` ${totalIncomplete} incomplete ${itemType} remain. Continue working.`;
-      } else if (newCount >= 3) {
-        // Only suggest cancel after minimum iterations (guard against no-tasks-created scenario)
-        reason += ` If all work is complete, run /oh-my-claudecode:cancel to cleanly exit ultrawork mode and clean up state files. If cancel fails, retry with /oh-my-claudecode:cancel --force. Otherwise, continue working.`;
       } else {
-        // Early iterations with no tasks yet - just tell LLM to continue
         reason += ` Continue working - create Tasks to track your progress.`;
       }
+
+      reason += ` If all requested work is fully complete and verified right now, your next action must be /oh-my-claudecode:cancel to cleanly exit ultrawork mode and clean up state files. If that command fails, retry with /oh-my-claudecode:cancel --force. Do not just say the work is done.`;
 
       if (ultrawork.state.original_prompt) {
         reason += `\nTask: ${ultrawork.state.original_prompt}`;
       }
 
-      console.log(JSON.stringify({ decision: "block", reason }));
+      console.log(JSON.stringify({ continue: false, decision: "block", reason }));
       return;
     }
 
-    // Priority 8: Ecomode - ALWAYS continue while active
-    if (ecomode.state?.active && !isStaleState(ecomode.state) && isSessionMatch(ecomode.state, sessionId)) {
-      const newCount = (ecomode.state.reinforcement_count || 0) + 1;
-      const maxReinforcements = ecomode.state.max_reinforcements || 50;
+    // Priority 9: Skill Active State (issue #1033)
+    // Skills like code-review, plan, ralplan, tdd, etc. write skill-active-state.json
+    // when invoked via the Skill tool. This prevents premature stops mid-skill.
+    {
+      const skillState = readStateFileWithSession(stateDir, "skill-active-state.json", sessionId);
+      if (skillState.state?.active) {
+        // Staleness check (per-skill TTL)
+        const sLastChecked = skillState.state.last_checked_at ? new Date(skillState.state.last_checked_at).getTime() : 0;
+        const sStartedAt = skillState.state.started_at ? new Date(skillState.state.started_at).getTime() : 0;
+        const sMostRecent = Math.max(sLastChecked, sStartedAt);
+        const sTtl = skillState.state.stale_ttl_ms || 5 * 60 * 1000;
+        const sAge = sMostRecent > 0 ? Date.now() - sMostRecent : Infinity;
+        const isStale = sMostRecent === 0 || sAge > sTtl;
 
-      if (newCount > maxReinforcements) {
-        // Max reinforcements reached - allow stop
-        console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-        return;
+        if (!isStale && isSessionMatch(skillState.state, sessionId)) {
+          const count = skillState.state.reinforcement_count || 0;
+          const maxReinforcements = skillState.state.max_reinforcements || 3;
+
+          if (count < maxReinforcements) {
+            skillState.state.reinforcement_count = count + 1;
+            skillState.state.last_checked_at = new Date().toISOString();
+            writeJsonFile(skillState.path, skillState.state);
+
+            const skillName = skillState.state.skill_name || "unknown";
+            console.log(JSON.stringify({
+              continue: false, decision: "block",
+              reason: `[SKILL ACTIVE: ${skillName}] The "${skillName}" skill is still executing (reinforcement ${count + 1}/${maxReinforcements}). Continue working on the skill's instructions. Do not stop until the skill completes its workflow.`,
+            }));
+            return;
+          } else {
+            // Reinforcement limit reached - clear state and allow stop
+            try { if (skillState.path && existsSync(skillState.path)) unlinkSync(skillState.path); } catch {}
+          }
+        }
       }
-
-      ecomode.state.reinforcement_count = newCount;
-      ecomode.state.last_checked_at = new Date().toISOString();
-      writeJsonFile(ecomode.path, ecomode.state);
-
-      // Fire-and-forget notification
-      sendStopNotification('ecomode', ecomode.state, sessionId, directory).catch(() => {});
-
-      let reason = `[ECOMODE #${newCount}/${maxReinforcements}] Mode active.`;
-
-      if (totalIncomplete > 0) {
-        const itemType = taskCount > 0 ? "Tasks" : "todos";
-        reason += ` ${totalIncomplete} incomplete ${itemType} remain. Continue working.`;
-      } else if (newCount >= 3) {
-        // Only suggest cancel after minimum iterations (guard against no-tasks-created scenario)
-        reason += ` If all work is complete, run /oh-my-claudecode:cancel to cleanly exit ecomode and clean up state files. If cancel fails, retry with /oh-my-claudecode:cancel --force. Otherwise, continue working.`;
-      } else {
-        // Early iterations with no tasks yet - just tell LLM to continue
-        reason += ` Continue working - create Tasks to track your progress.`;
-      }
-
-      console.log(JSON.stringify({ decision: "block", reason }));
-      return;
     }
 
     // No blocking needed — Claude is truly idle.
     // Send session-idle notification (fire-and-forget) so external integrations
     // (Telegram, Discord) know the session went idle without any active mode.
-    if (sessionId) {
+    // Per-session cooldown prevents notification spam when the session idles repeatedly.
+    if (sessionId && shouldSendIdleNotification(stateDir)) {
       try {
         const pluginRoot = process.env.CLAUDE_PLUGIN_ROOT;
         if (pluginRoot) {
@@ -625,6 +1023,7 @@ async function main() {
               }).catch(() => {})
             )
             .catch(() => {});
+          recordIdleNotificationSent(stateDir);
         }
       } catch {
         // Notification module not available, skip silently

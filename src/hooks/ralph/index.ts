@@ -21,6 +21,13 @@ export {
   createRalphLoopHook,
   isUltraQAActive,
 
+  // PRD flag helpers
+  detectNoPrdFlag,
+  stripNoPrdFlag,
+  detectCriticModeFlag,
+  stripCriticModeFlag,
+  normalizeRalphCriticMode,
+
   // Team coordination
   getTeamPhaseDirective,
 
@@ -36,6 +43,7 @@ export {
 
   // Types
   type RalphLoopState,
+  type RalphCriticMode,
   type RalphLoopOptions,
   type RalphLoopHook,
   type PRD,

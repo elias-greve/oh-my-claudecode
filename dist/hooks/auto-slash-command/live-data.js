@@ -17,8 +17,11 @@
 import { execSync } from "child_process";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
+import { getWorktreeRoot, getOmcRoot } from "../../lib/worktree-paths.js";
 const TIMEOUT_MS = 10_000;
 const MAX_OUTPUT_BYTES = 50 * 1024;
+const MAX_CACHE_SIZE = 200;
+const MAX_ONCE_COMMANDS = 500;
 // Pre-compiled regex patterns for performance
 const LIVE_DATA_LINE_PATTERN = /^\s*!(.+)/;
 const CODE_BLOCK_FENCE_PATTERN = /^\s*(`{3,}|~{3,})/;
@@ -67,7 +70,23 @@ function getCached(command) {
 function setCache(command, output, error, ttl) {
     if (ttl <= 0)
         return;
+    if (cache.size >= MAX_CACHE_SIZE) {
+        const firstKey = cache.keys().next().value;
+        if (firstKey !== undefined)
+            cache.delete(firstKey);
+    }
     cache.set(command, { output, error, cachedAt: Date.now(), ttl });
+}
+function markCommandExecuted(command) {
+    if (onceCommands.has(command)) {
+        return;
+    }
+    if (onceCommands.size >= MAX_ONCE_COMMANDS) {
+        const firstKey = onceCommands.values().next().value;
+        if (firstKey !== undefined)
+            onceCommands.delete(firstKey);
+    }
+    onceCommands.add(command);
 }
 /** Clear all caches (useful for testing) */
 export function clearCache() {
@@ -78,9 +97,10 @@ export function clearCache() {
 let cachedPolicy = null;
 let policyLoadedFrom = null;
 function loadSecurityPolicy() {
+    const root = getWorktreeRoot() || process.cwd();
     const policyPaths = [
-        join(process.cwd(), ".omc", "config", "live-data-policy.json"),
-        join(process.cwd(), ".claude", "live-data-policy.json"),
+        join(getOmcRoot(root), "config", "live-data-policy.json"),
+        join(root, ".claude", "live-data-policy.json"),
     ];
     for (const p of policyPaths) {
         if (p === policyLoadedFrom && cachedPolicy)
@@ -105,7 +125,8 @@ export function resetSecurityPolicy() {
 }
 function checkSecurity(command) {
     const policy = loadSecurityPolicy();
-    // Check denied patterns first
+    const cmdBase = command.split(WHITESPACE_SPLIT_PATTERN)[0];
+    // Check denied patterns first (always enforced)
     if (policy.denied_patterns) {
         for (const pat of policy.denied_patterns) {
             try {
@@ -119,34 +140,44 @@ function checkSecurity(command) {
         }
     }
     if (policy.denied_commands) {
-        const cmdBase = command.split(WHITESPACE_SPLIT_PATTERN)[0];
         if (policy.denied_commands.includes(cmdBase)) {
             return { allowed: false, reason: `command '${cmdBase}' is denied` };
         }
     }
-    if (policy.allowed_commands && policy.allowed_commands.length > 0) {
-        const cmdBase = command.split(WHITESPACE_SPLIT_PATTERN)[0];
-        const baseAllowed = policy.allowed_commands.includes(cmdBase);
-        let patternAllowed = false;
-        if (policy.allowed_patterns) {
-            for (const pat of policy.allowed_patterns) {
-                try {
-                    if (new RegExp(pat).test(command)) {
-                        patternAllowed = true;
-                        break;
-                    }
-                }
-                catch {
-                    // skip invalid regex
+    // Default-deny: if an allowlist is configured, command MUST match it
+    // If no allowlist is configured at all, deny by default for safety
+    const hasAllowlist = (policy.allowed_commands && policy.allowed_commands.length > 0) ||
+        (policy.allowed_patterns && policy.allowed_patterns.length > 0);
+    if (!hasAllowlist) {
+        return {
+            allowed: false,
+            reason: `no allowlist configured - command execution blocked by default`,
+        };
+    }
+    // Check if command matches allowlist
+    let baseAllowed = false;
+    let patternAllowed = false;
+    if (policy.allowed_commands) {
+        baseAllowed = policy.allowed_commands.includes(cmdBase);
+    }
+    if (policy.allowed_patterns) {
+        for (const pat of policy.allowed_patterns) {
+            try {
+                if (new RegExp(pat).test(command)) {
+                    patternAllowed = true;
+                    break;
                 }
             }
+            catch {
+                // skip invalid regex
+            }
         }
-        if (!baseAllowed && !patternAllowed) {
-            return {
-                allowed: false,
-                reason: `command '${cmdBase}' not in allowlist`,
-            };
-        }
+    }
+    if (!baseAllowed && !patternAllowed) {
+        return {
+            allowed: false,
+            reason: `command '${cmdBase}' not in allowlist`,
+        };
     }
     return { allowed: true };
 }
@@ -167,6 +198,10 @@ function getCodeBlockRanges(lines) {
                 openIndex = null;
             }
         }
+    }
+    // Unclosed fence: treat every line after the opening fence as inside a code block
+    if (openIndex !== null) {
+        ranges.push([openIndex, lines.length]);
     }
     return ranges;
 }
@@ -278,17 +313,29 @@ function executeCommand(command) {
         return { stdout: String(message), error: true };
     }
 }
+// ─── HTML Escaping ───────────────────────────────────────────────────────────
+/** Escape characters that are special in XML/HTML attributes and content. */
+function escapeHtml(s) {
+    return s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
 // ─── Output Formatting ──────────────────────────────────────────────────────
 function formatOutput(command, output, error, format) {
+    const escapedCommand = escapeHtml(command);
+    const escapedOutput = escapeHtml(output);
     const formatAttr = format ? ` format="${format}"` : "";
     const errorAttr = error ? ' error="true"' : "";
     if (format === "diff" && !error) {
         const addLines = (output.match(DIFF_ADDED_LINES_PATTERN) || []).length;
         const delLines = (output.match(DIFF_DELETED_LINES_PATTERN) || []).length;
         const files = new Set((output.match(DIFF_FILE_HEADER_PATTERN) || []).map((l) => l.replace(DIFF_HEADER_PREFIX_PATTERN, ""))).size;
-        return `<live-data command="${command}"${formatAttr} files="${files}" +="${addLines}" -="${delLines}"${errorAttr}>${output}</live-data>`;
+        return `<live-data command="${escapedCommand}"${formatAttr} files="${files}" +="${addLines}" -="${delLines}"${errorAttr}>${escapedOutput}</live-data>`;
     }
-    return `<live-data command="${command}"${formatAttr}${errorAttr}>${output}</live-data>`;
+    return `<live-data command="${escapedCommand}"${formatAttr}${errorAttr}>${escapedOutput}</live-data>`;
 }
 function extractScriptBlocks(lines, codeBlockRanges) {
     const blocks = [];
@@ -335,7 +382,7 @@ export function resolveLiveData(content) {
         }
         const security = checkSecurity(block.shell);
         if (!security.allowed) {
-            scriptReplacements.set(block.startLine, `<live-data command="script:${block.shell}" error="true">blocked: ${security.reason}</live-data>`);
+            scriptReplacements.set(block.startLine, `<live-data command="script:${escapeHtml(block.shell)}" error="true">blocked: ${escapeHtml(security.reason ?? "")}</live-data>`);
             continue;
         }
         // Write script to stdin of shell
@@ -347,13 +394,13 @@ export function resolveLiveData(content) {
                 encoding: "utf-8",
                 stdio: ["pipe", "pipe", "pipe"],
             });
-            scriptReplacements.set(block.startLine, `<live-data command="script:${block.shell}">${result ?? ""}</live-data>`);
+            scriptReplacements.set(block.startLine, `<live-data command="script:${escapeHtml(block.shell)}">${escapeHtml(result ?? "")}</live-data>`);
         }
         catch (err) {
             const message = err instanceof Error
                 ? err.stderr || err.message
                 : String(err);
-            scriptReplacements.set(block.startLine, `<live-data command="script:${block.shell}" error="true">${message}</live-data>`);
+            scriptReplacements.set(block.startLine, `<live-data command="script:${escapeHtml(block.shell)}" error="true">${escapeHtml(message)}</live-data>`);
         }
     }
     // Second pass: process line by line
@@ -375,13 +422,13 @@ export function resolveLiveData(content) {
         // Security check
         const security = checkSecurity(directive.command);
         if (!security.allowed) {
-            result.push(`<live-data command="${directive.command}" error="true">blocked: ${security.reason}</live-data>`);
+            result.push(`<live-data command="${escapeHtml(directive.command)}" error="true">blocked: ${escapeHtml(security.reason ?? "")}</live-data>`);
             continue;
         }
         switch (directive.type) {
             case "if-modified": {
                 if (!checkIfModified(directive.pattern)) {
-                    result.push(`<live-data command="${directive.command}" skipped="true">condition not met: no files matching '${directive.pattern}' modified</live-data>`);
+                    result.push(`<live-data command="${escapeHtml(directive.command)}" skipped="true">condition not met: no files matching '${escapeHtml(directive.pattern)}' modified</live-data>`);
                 }
                 else {
                     const { stdout, error } = executeCommand(directive.command);
@@ -391,7 +438,7 @@ export function resolveLiveData(content) {
             }
             case "if-branch": {
                 if (!checkIfBranch(directive.pattern)) {
-                    result.push(`<live-data command="${directive.command}" skipped="true">condition not met: branch does not match '${directive.pattern}'</live-data>`);
+                    result.push(`<live-data command="${escapeHtml(directive.command)}" skipped="true">condition not met: branch does not match '${escapeHtml(directive.pattern)}'</live-data>`);
                 }
                 else {
                     const { stdout, error } = executeCommand(directive.command);
@@ -401,10 +448,10 @@ export function resolveLiveData(content) {
             }
             case "only-once": {
                 if (onceCommands.has(directive.command)) {
-                    result.push(`<live-data command="${directive.command}" skipped="true">already executed this session</live-data>`);
+                    result.push(`<live-data command="${escapeHtml(directive.command)}" skipped="true">already executed this session</live-data>`);
                 }
                 else {
-                    onceCommands.add(directive.command);
+                    markCommandExecuted(directive.command);
                     const { stdout, error } = executeCommand(directive.command);
                     result.push(formatOutput(directive.command, stdout, error, null));
                 }

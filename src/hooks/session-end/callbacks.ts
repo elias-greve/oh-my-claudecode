@@ -6,7 +6,7 @@
  */
 
 import { writeFileSync, mkdirSync } from 'fs';
-import { dirname, normalize, resolve } from 'path';
+import { dirname, normalize } from 'path';
 import { homedir } from 'os';
 import type { SessionMetrics } from './index.js';
 import {
@@ -39,6 +39,10 @@ export function formatSessionSummary(metrics: SessionMetrics, format: 'markdown'
 **Started At:** ${metrics.started_at || 'unknown'}
 **Ended At:** ${metrics.ended_at}
 `.trim();
+}
+
+export interface TriggerStopCallbacksOptions {
+  skipPlatforms?: Array<'file' | 'telegram' | 'discord'>;
 }
 
 function normalizeDiscordTagList(tagList?: string[]): string[] {
@@ -229,10 +233,12 @@ async function sendDiscord(
  */
 export async function triggerStopCallbacks(
   metrics: SessionMetrics,
-  _input: { session_id: string; cwd: string }
+  _input: { session_id: string; cwd: string },
+  options: TriggerStopCallbacksOptions = {}
 ): Promise<void> {
   const config = getOMCConfig();
   const callbacks = config.stopHookCallbacks;
+  const skipPlatforms = new Set(options.skipPlatforms ?? []);
 
   if (!callbacks) {
     return; // No callbacks configured
@@ -241,20 +247,20 @@ export async function triggerStopCallbacks(
   // Execute all enabled callbacks (non-blocking)
   const promises: Promise<void>[] = [];
 
-  if (callbacks.file?.enabled && callbacks.file.path) {
+  if (!skipPlatforms.has('file') && callbacks.file?.enabled && callbacks.file.path) {
     const format = callbacks.file.format || 'markdown';
     const summary = formatSessionSummary(metrics, format);
     promises.push(writeToFile(callbacks.file, summary, metrics.session_id));
   }
 
-  if (callbacks.telegram?.enabled) {
+  if (!skipPlatforms.has('telegram') && callbacks.telegram?.enabled) {
     const summary = formatSessionSummary(metrics, 'markdown');
     const tags = normalizeTelegramTagList(callbacks.telegram.tagList);
     const message = prefixMessageWithTags(summary, tags);
     promises.push(sendTelegram(callbacks.telegram, message));
   }
 
-  if (callbacks.discord?.enabled) {
+  if (!skipPlatforms.has('discord') && callbacks.discord?.enabled) {
     const summary = formatSessionSummary(metrics, 'markdown');
     const tags = normalizeDiscordTagList(callbacks.discord.tagList);
     const message = prefixMessageWithTags(summary, tags);

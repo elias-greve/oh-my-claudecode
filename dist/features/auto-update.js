@@ -11,9 +11,10 @@
  */
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
-import { execSync } from 'child_process';
-import { install as installSisyphus, HOOKS_DIR, isProjectScopedPlugin, isRunningAsPlugin } from '../installer/index.js';
+import { execSync, execFileSync } from 'child_process';
+import { install as installOmc, HOOKS_DIR, isProjectScopedPlugin, isRunningAsPlugin } from '../installer/index.js';
 import { getConfigDir } from '../utils/config-dir.js';
+import { purgeStalePluginCacheVersions } from '../utils/paths.js';
 /** GitHub repository information */
 export const REPO_OWNER = 'Yeachan-Heo';
 export const REPO_NAME = 'oh-my-claudecode';
@@ -33,21 +34,31 @@ function syncMarketplaceClone(verbose = false) {
     const stdio = verbose ? 'inherit' : 'pipe';
     const execOpts = { encoding: 'utf-8', stdio: stdio, timeout: 60000 };
     try {
-        execSync(`git -C "${marketplacePath}" fetch --all --prune`, execOpts);
+        execFileSync('git', ['-C', marketplacePath, 'fetch', '--all', '--prune'], execOpts);
     }
     catch (err) {
         return { ok: false, message: `Failed to fetch marketplace clone: ${err instanceof Error ? err.message : err}` };
     }
     // Ensure we're on main (ignore errors for older clones on different branches)
     try {
-        execSync(`git -C "${marketplacePath}" checkout main`, { ...execOpts, timeout: 15000 });
+        execFileSync('git', ['-C', marketplacePath, 'checkout', 'main'], { ...execOpts, timeout: 15000 });
     }
     catch { /* ignore checkout errors on older clones */ }
+    // Reset to upstream state -- the marketplace clone is a managed read-only
+    // checkout, so any local modifications (e.g. regenerated dist files) can be
+    // safely discarded.  This avoids the "dirty worktree" failure that
+    // `git pull --ff-only` would hit when untracked/modified files exist (#978).
     try {
-        execSync(`git -C "${marketplacePath}" pull --ff-only origin main`, execOpts);
+        execFileSync('git', ['-C', marketplacePath, 'reset', '--hard', 'origin/main'], execOpts);
     }
     catch (err) {
-        return { ok: false, message: `Failed to update marketplace clone: ${err instanceof Error ? err.message : err}` };
+        return { ok: false, message: `Failed to reset marketplace clone: ${err instanceof Error ? err.message : err}` };
+    }
+    try {
+        execFileSync('git', ['-C', marketplacePath, 'clean', '-fd'], execOpts);
+    }
+    catch {
+        // clean is best-effort; untracked leftovers won't break anything
     }
     return { ok: true, message: 'Marketplace clone updated' };
 }
@@ -72,12 +83,11 @@ export function getOMCConfig() {
             configVersion: config.configVersion,
             taskTool: config.taskTool,
             taskToolConfig: config.taskToolConfig,
-            defaultExecutionMode: config.defaultExecutionMode,
-            ecomode: config.ecomode,
             setupCompleted: config.setupCompleted,
             setupVersion: config.setupVersion,
             stopHookCallbacks: config.stopHookCallbacks,
             notifications: config.notifications,
+            notificationProfiles: config.notificationProfiles,
             hudEnabled: config.hudEnabled,
             autoUpgradePrompt: config.autoUpgradePrompt,
         };
@@ -99,15 +109,6 @@ export function isSilentAutoUpdateEnabled() {
  */
 export function isAutoUpgradePromptEnabled() {
     return getOMCConfig().autoUpgradePrompt !== false;
-}
-/**
- * Check if ecomode is enabled
- * Returns true by default if not explicitly disabled
- */
-export function isEcomodeEnabled() {
-    const config = getOMCConfig();
-    // Default to true if not configured
-    return config.ecomode?.enabled !== false;
 }
 /**
  * Check if team feature is enabled
@@ -284,7 +285,7 @@ export function reconcileUpdateRuntime(options) {
         }
     }
     try {
-        const installResult = installSisyphus({
+        const installResult = installOmc({
             force: true,
             verbose: options?.verbose ?? false,
             skipClaudeCheck: true,
@@ -298,6 +299,21 @@ export function reconcileUpdateRuntime(options) {
     catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         errors.push(`Failed to refresh installer artifacts: ${message}`);
+    }
+    // Purge stale plugin cache versions (non-fatal)
+    try {
+        const purgeResult = purgeStalePluginCacheVersions();
+        if (purgeResult.removed > 0 && options?.verbose) {
+            console.log(`[omc] Purged ${purgeResult.removed} stale plugin cache version(s)`);
+        }
+        if (purgeResult.errors.length > 0 && options?.verbose) {
+            for (const err of purgeResult.errors) {
+                console.warn(`[omc] Cache purge warning: ${err}`);
+            }
+        }
+    }
+    catch {
+        // Cache purge is best-effort; never block reconciliation
     }
     if (errors.length > 0) {
         return {
@@ -343,29 +359,68 @@ export async function performUpdate(options) {
             if (!marketplaceSync.ok && options?.verbose) {
                 console.warn(`[omc update] ${marketplaceSync.message}`);
             }
-            const reconcileResult = reconcileUpdateRuntime({ verbose: options?.verbose });
-            if (!reconcileResult.success) {
+            // CRITICAL FIX: After npm updates the global package, the current process
+            // still has OLD code loaded in memory. We must re-exec to run reconciliation
+            // with the NEW code. Otherwise, installOmc() runs OLD logic against NEW files.
+            if (!process.env.OMC_UPDATE_RECONCILE) {
+                // Set flag to prevent infinite loop
+                process.env.OMC_UPDATE_RECONCILE = '1';
+                // Find the omc binary path
+                const omcPath = execSync('which omc 2>/dev/null || where omc 2>NUL', {
+                    encoding: 'utf-8',
+                    stdio: 'pipe',
+                }).trim().split('\n')[0];
+                // Re-exec with reconcile subcommand
+                try {
+                    execFileSync(omcPath, ['update-reconcile'], {
+                        encoding: 'utf-8',
+                        stdio: options?.verbose ? 'inherit' : 'pipe',
+                        timeout: 60000,
+                        env: { ...process.env, OMC_UPDATE_RECONCILE: '1' }
+                    });
+                }
+                catch (reconcileError) {
+                    return {
+                        success: false,
+                        previousVersion,
+                        newVersion,
+                        message: `Updated to ${newVersion}, but runtime reconciliation failed`,
+                        errors: [reconcileError instanceof Error ? reconcileError.message : String(reconcileError)],
+                    };
+                }
+                // Update version metadata after reconciliation succeeds
+                saveVersionMetadata({
+                    version: newVersion,
+                    installedAt: new Date().toISOString(),
+                    installMethod: 'npm',
+                    lastCheckAt: new Date().toISOString()
+                });
                 return {
-                    success: false,
+                    success: true,
                     previousVersion,
                     newVersion,
-                    message: `Updated to ${newVersion}, but runtime reconciliation failed`,
-                    errors: reconcileResult.errors,
+                    message: `Successfully updated from ${previousVersion ?? 'unknown'} to ${newVersion}`
                 };
             }
-            // Update version metadata after reconciliation succeeds
-            saveVersionMetadata({
-                version: newVersion,
-                installedAt: new Date().toISOString(),
-                installMethod: 'npm',
-                lastCheckAt: new Date().toISOString()
-            });
-            return {
-                success: true,
-                previousVersion,
-                newVersion,
-                message: `Successfully updated from ${previousVersion ?? 'unknown'} to ${newVersion}`
-            };
+            else {
+                // We're in the re-exec'd process - run reconciliation directly
+                const reconcileResult = reconcileUpdateRuntime({ verbose: options?.verbose });
+                if (!reconcileResult.success) {
+                    return {
+                        success: false,
+                        previousVersion,
+                        newVersion,
+                        message: `Updated to ${newVersion}, but runtime reconciliation failed`,
+                        errors: reconcileResult.errors?.map(e => `Reconciliation failed: ${e}`),
+                    };
+                }
+                return {
+                    success: true,
+                    previousVersion,
+                    newVersion,
+                    message: 'Reconciliation completed successfully'
+                };
+            }
         }
         catch (npmError) {
             throw new Error('Auto-update via npm failed. Please run manually:\n' +

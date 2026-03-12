@@ -4,7 +4,7 @@ import { DEFAULT_HUD_CONFIG } from '../../hud/types.js';
 function createMinimalContext(overrides = {}) {
     return {
         contextPercent: 30,
-        modelName: 'claude-sonnet-4.5',
+        modelName: 'claude-sonnet-4.6',
         ralph: null,
         ultrawork: null,
         prd: null,
@@ -14,12 +14,19 @@ function createMinimalContext(overrides = {}) {
         backgroundTasks: [],
         cwd: '/tmp/test',
         lastSkill: null,
-        rateLimits: null,
+        rateLimitsResult: null,
+        customBuckets: null,
         pendingPermission: null,
         thinkingState: null,
         sessionHealth: null,
         omcVersion: null,
         updateAvailable: null,
+        toolCallCount: 0,
+        agentCallCount: 0,
+        skillCallCount: 0,
+        promptTime: null,
+        apiKeySource: null,
+        profileName: null,
         ...overrides,
     };
 }

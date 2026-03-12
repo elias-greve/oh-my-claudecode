@@ -7,7 +7,8 @@ import {
   readUltraworkState,
   shouldReinforceUltrawork,
   deactivateUltrawork,
-  incrementReinforcement
+  incrementReinforcement,
+  getUltraworkPersistenceMessage,
 } from './index.js';
 
 describe('Ultrawork Session Isolation (Issue #269)', () => {
@@ -140,7 +141,7 @@ describe('Ultrawork Session Isolation (Issue #269)', () => {
       // Session A activates ultrawork
       activateUltrawork('Session A task', sessionA, tempDir);
 
-      let state = readUltraworkState(tempDir, sessionA);
+      const state = readUltraworkState(tempDir, sessionA);
       expect(state?.active).toBe(true);
       expect(state?.session_id).toBe(sessionA);
 
@@ -214,6 +215,17 @@ describe('Ultrawork Session Isolation (Issue #269)', () => {
   });
 
   describe('Edge cases', () => {
+    it('includes a direct cancel instruction in the persistence message', () => {
+      activateUltrawork('Finish the scoped fix', 'session-cancel-directive', tempDir);
+
+      const state = readUltraworkState(tempDir, 'session-cancel-directive');
+      expect(state).not.toBeNull();
+
+      const message = getUltraworkPersistenceMessage(state!);
+      expect(message).toContain('/oh-my-claudecode:cancel');
+      expect(message).toContain('VERY NEXT action');
+    });
+
     it('should reject empty string and undefined session IDs for isolation safety', () => {
       const emptySession = '';
       activateUltrawork('Task with empty session', emptySession, tempDir);

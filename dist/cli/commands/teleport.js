@@ -170,8 +170,8 @@ function sanitize(str, maxLen = 30) {
  */
 function getCurrentRepo() {
     try {
-        const root = execSync('git rev-parse --show-toplevel', { encoding: 'utf-8' }).trim();
-        const remoteUrl = execSync('git remote get-url origin', { encoding: 'utf-8' }).trim();
+        const root = execSync('git rev-parse --show-toplevel', { encoding: 'utf-8', timeout: 5000 }).trim();
+        const remoteUrl = execSync('git remote get-url origin', { encoding: 'utf-8', timeout: 5000 }).trim();
         const parsed = parseRemoteUrl(remoteUrl);
         if (parsed) {
             return { owner: parsed.owner, repo: parsed.repo, root, provider: parsed.provider };
@@ -208,13 +208,13 @@ function createWorktree(repoRoot, worktreePath, branchName, baseBranch) {
             return { success: false, error: `Worktree already exists at ${worktreePath}` };
         }
         // Fetch latest from origin
-        execSync(`git fetch origin ${baseBranch}`, {
+        execFileSync('git', ['fetch', 'origin', baseBranch], {
             cwd: repoRoot,
             stdio: 'pipe',
         });
         // Create branch from base if it doesn't exist
         try {
-            execSync(`git branch ${branchName} origin/${baseBranch}`, {
+            execFileSync('git', ['branch', branchName, `origin/${baseBranch}`], {
                 cwd: repoRoot,
                 stdio: 'pipe',
             });
@@ -223,7 +223,7 @@ function createWorktree(repoRoot, worktreePath, branchName, baseBranch) {
             // Branch might already exist, that's OK
         }
         // Create the worktree
-        execSync(`git worktree add "${worktreePath}" ${branchName}`, {
+        execFileSync('git', ['worktree', 'add', worktreePath, branchName], {
             cwd: repoRoot,
             stdio: 'pipe',
         });
@@ -462,6 +462,7 @@ export async function teleportListCommand(options) {
 }
 /**
  * Remove a worktree
+ * Returns 0 on success, 1 on failure.
  */
 export async function teleportRemoveCommand(pathOrName, options) {
     const worktreeRoot = DEFAULT_WORKTREE_ROOT;
@@ -478,7 +479,7 @@ export async function teleportRemoveCommand(pathOrName, options) {
         else {
             console.error(chalk.red(error));
         }
-        return;
+        return 1;
     }
     // Safety check: must be under worktree root
     const rel = relative(worktreeRoot, worktreePath);
@@ -490,7 +491,7 @@ export async function teleportRemoveCommand(pathOrName, options) {
         else {
             console.error(chalk.red(error));
         }
-        return;
+        return 1;
     }
     try {
         // Check for uncommitted changes
@@ -507,7 +508,7 @@ export async function teleportRemoveCommand(pathOrName, options) {
                 else {
                     console.error(chalk.red(error));
                 }
-                return;
+                return 1;
             }
         }
         // Find the main repo to run git worktree remove
@@ -520,8 +521,10 @@ export async function teleportRemoveCommand(pathOrName, options) {
         const mainRepoMatch = gitDir.match(/(.+)[/\\]\.git[/\\]worktrees[/\\]/);
         const mainRepo = mainRepoMatch ? mainRepoMatch[1] : null;
         if (mainRepo) {
-            const forceFlag = options.force ? '--force' : '';
-            execSync(`git worktree remove "${worktreePath}" ${forceFlag}`, {
+            const args = options.force
+                ? ['worktree', 'remove', '--force', worktreePath]
+                : ['worktree', 'remove', worktreePath];
+            execFileSync('git', args, {
                 cwd: mainRepo,
                 stdio: 'pipe',
             });
@@ -536,6 +539,7 @@ export async function teleportRemoveCommand(pathOrName, options) {
         else {
             console.log(chalk.green(`Removed worktree: ${worktreePath}`));
         }
+        return 0;
     }
     catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -545,6 +549,7 @@ export async function teleportRemoveCommand(pathOrName, options) {
         else {
             console.error(chalk.red(`Failed to remove worktree: ${message}`));
         }
+        return 1;
     }
 }
 //# sourceMappingURL=teleport.js.map

@@ -17,6 +17,21 @@ export function getCurrentTmuxSession(): string | null {
   }
 
   try {
+    // Use $TMUX_PANE to find the session this process actually belongs to.
+    // tmux display-message -p '#S' returns the *attached* session name, which
+    // is wrong when Claude runs in a detached session.
+    const paneId = process.env.TMUX_PANE;
+    if (paneId) {
+      const lines = execSync("tmux list-panes -a -F '#{pane_id} #{session_name}'", {
+        encoding: "utf-8",
+        timeout: 3000,
+        stdio: ["pipe", "pipe", "pipe"],
+      }).split("\n");
+      const match = lines.find((l) => l.startsWith(paneId + " "));
+      if (match) return match.split(" ")[1] ?? null;
+    }
+
+    // Fallback: ask the attached session (may differ when detached).
     const sessionName = execSync("tmux display-message -p '#S'", {
       encoding: "utf-8",
       timeout: 3000,
@@ -61,4 +76,30 @@ export function formatTmuxInfo(): string | null {
   const session = getCurrentTmuxSession();
   if (!session) return null;
   return `tmux: ${session}`;
+}
+
+/**
+ * Get the current tmux pane ID (e.g., "%0").
+ * Returns null if not running inside tmux.
+ *
+ * Tries $TMUX_PANE env var first, falls back to tmux display-message.
+ */
+export function getCurrentTmuxPaneId(): string | null {
+  if (!process.env.TMUX) return null;
+
+  // Prefer $TMUX_PANE (set by tmux automatically)
+  const envPane = process.env.TMUX_PANE;
+  if (envPane && /^%\d+$/.test(envPane)) return envPane;
+
+  // Fallback: ask tmux directly (similar to getCurrentTmuxSession)
+  try {
+    const paneId = execSync("tmux display-message -p '#{pane_id}'", {
+      encoding: "utf-8",
+      timeout: 3000,
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    return paneId && /^%\d+$/.test(paneId) ? paneId : null;
+  } catch {
+    return null;
+  }
 }

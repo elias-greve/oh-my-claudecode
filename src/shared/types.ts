@@ -1,5 +1,5 @@
 /**
- * Shared types for Oh-My-Claude-Sisyphus
+ * Shared types for Oh-My-ClaudeCode
  */
 
 export type ModelType = 'sonnet' | 'opus' | 'haiku' | 'inherit';
@@ -12,26 +12,32 @@ export interface AgentConfig {
   tools?: string[];
   /** Tools explicitly disallowed for this agent */
   disallowedTools?: string[];
-  model?: ModelType;
-  defaultModel?: ModelType;
+  model?: string;
+  defaultModel?: string;
 }
 
 export interface PluginConfig {
   // Agent model overrides
   agents?: {
     omc?: { model?: string };
-    architect?: { model?: string; enabled?: boolean };
-    researcher?: { model?: string };
     explore?: { model?: string };
-    frontendEngineer?: { model?: string; enabled?: boolean };
-    documentWriter?: { model?: string; enabled?: boolean };
-    multimodalLooker?: { model?: string; enabled?: boolean };
-    // New agents from oh-my-opencode
-    critic?: { model?: string; enabled?: boolean };
-    analyst?: { model?: string; enabled?: boolean };
-    orchestratorSisyphus?: { model?: string; enabled?: boolean };
-    sisyphusJunior?: { model?: string; enabled?: boolean };
-    planner?: { model?: string; enabled?: boolean };
+    analyst?: { model?: string };
+    planner?: { model?: string };
+    architect?: { model?: string };
+    debugger?: { model?: string };
+    executor?: { model?: string };
+    verifier?: { model?: string };
+    securityReviewer?: { model?: string };
+    codeReviewer?: { model?: string };
+    testEngineer?: { model?: string };
+    designer?: { model?: string };
+    writer?: { model?: string };
+    qaTester?: { model?: string };
+    scientist?: { model?: string };
+    gitMaster?: { model?: string };
+    codeSimplifier?: { model?: string };
+    critic?: { model?: string };
+    documentSpecialist?: { model?: string };
   };
 
   // Feature toggles
@@ -71,6 +77,13 @@ export interface PluginConfig {
     enabled?: boolean;
     /** Default tier when no rules match */
     defaultTier?: 'LOW' | 'MEDIUM' | 'HIGH';
+    /**
+     * Force all agents to inherit the parent model instead of using OMC model routing.
+     * When true, the `model` parameter is stripped from all Task calls so agents use
+     * the user's Claude Code model setting. Overrides all per-agent model recommendations.
+     * Env: OMC_ROUTING_FORCE_INHERIT=true
+     */
+    forceInherit?: boolean;
     /** Enable automatic escalation on failure */
     escalationEnabled?: boolean;
     /** Maximum escalation attempts */
@@ -86,6 +99,21 @@ export interface PluginConfig {
       tier: 'LOW' | 'MEDIUM' | 'HIGH';
       reason: string;
     }>;
+    /**
+     * Model alias overrides.
+     *
+     * Maps agent-definition model tier names to replacement values.
+     * Checked AFTER explicit model params (highest priority) but BEFORE
+     * agent-definition defaults (lowest priority).
+     *
+     * Use cases:
+     * - `{ haiku: 'inherit' }` — haiku agents inherit the parent model
+     *   (useful on non-Anthropic backends without the nuclear forceInherit)
+     * - `{ haiku: 'sonnet' }` — promote all haiku agents to sonnet tier
+     *
+     * Env: OMC_MODEL_ALIAS_HAIKU, OMC_MODEL_ALIAS_SONNET, OMC_MODEL_ALIAS_OPUS
+     */
+    modelAliases?: Partial<Record<'haiku' | 'sonnet' | 'opus', ModelType>>;
     /** Keywords that force escalation to higher tier */
     escalationKeywords?: string[];
     /** Keywords that suggest lower tier */
@@ -97,6 +125,53 @@ export interface PluginConfig {
 
   // Delegation routing configuration
   delegationRouting?: DelegationRoutingConfig;
+
+  // Startup codebase map injection (issue #804)
+  startupCodebaseMap?: {
+    /** Enable codebase map injection on session start. Default: true */
+    enabled?: boolean;
+    /** Maximum files to include in the map. Default: 200 */
+    maxFiles?: number;
+    /** Maximum directory depth to scan. Default: 4 */
+    maxDepth?: number;
+  };
+
+  // Guards configuration (factcheck + sentinel) (issue #1155)
+  guards?: {
+    factcheck?: {
+      enabled?: boolean;
+      mode?: 'strict' | 'declared' | 'manual' | 'quick';
+      strict_project_patterns?: string[];
+      forbidden_path_prefixes?: string[];
+      forbidden_path_substrings?: string[];
+      readonly_command_prefixes?: string[];
+      warn_on_cwd_mismatch?: boolean;
+      enforce_cwd_parity_in_quick?: boolean;
+      warn_on_unverified_gates?: boolean;
+      warn_on_unverified_gates_when_no_source_files?: boolean;
+    };
+    sentinel?: {
+      enabled?: boolean;
+      readiness?: {
+        min_pass_rate?: number;
+        max_timeout_rate?: number;
+        max_warn_plus_fail_rate?: number;
+        min_reason_coverage_rate?: number;
+      };
+    };
+  };
+
+  // Task size detection configuration (issue #790)
+  taskSizeDetection?: {
+    /** Enable task-size detection to prevent over-orchestration for small tasks. Default: true */
+    enabled?: boolean;
+    /** Word count threshold below which a task is classified as "small". Default: 50 */
+    smallWordLimit?: number;
+    /** Word count threshold above which a task is classified as "large". Default: 200 */
+    largeWordLimit?: number;
+    /** Suppress heavy orchestration modes (ralph/autopilot/team/ultrawork) for small tasks. Default: true */
+    suppressHeavyModesForSmallTasks?: boolean;
+  };
 }
 
 export interface SessionState {
@@ -211,12 +286,15 @@ export interface ResolveOptions {
 /**
  * Provider type for delegation routing
  */
-export type DelegationProvider = 'claude' | 'codex' | 'gemini';
+export type DelegationProvider =
+  | 'claude'
+  /** Use /team to coordinate Codex CLI workers in tmux panes. */
+  | 'codex'
+  /** Use /team to coordinate Gemini CLI workers in tmux panes. */
+  | 'gemini';
 
-/**
- * Tool type for delegation routing
- */
-export type DelegationTool = 'Task' | 'ask_codex' | 'ask_gemini';
+/** Tool type for delegation routing — only Claude Task is supported. */
+export type DelegationTool = 'Task';
 
 /**
  * Individual route configuration for a role

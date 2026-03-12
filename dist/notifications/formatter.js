@@ -106,6 +106,7 @@ export function formatSessionEnd(payload) {
     if (payload.contextSummary) {
         lines.push("", `**Summary:** ${payload.contextSummary}`);
     }
+    appendTmuxTail(lines, payload);
     lines.push("");
     lines.push(buildFooter(payload, true));
     return lines.join("\n");
@@ -123,6 +124,91 @@ export function formatSessionIdle(payload) {
     }
     if (payload.modesUsed && payload.modesUsed.length > 0) {
         lines.push(`**Modes:** ${payload.modesUsed.join(", ")}`);
+    }
+    appendTmuxTail(lines, payload);
+    lines.push("");
+    lines.push(buildFooter(payload, true));
+    return lines.join("\n");
+}
+/** Matches ANSI escape sequences (CSI and two-character escapes). */
+const ANSI_ESCAPE_RE = /\x1b(?:[@-Z\\-_]|\[[0-9;]*[a-zA-Z])/g;
+/** Lines starting with these characters are OMC UI chrome, not output. */
+const UI_CHROME_RE = /^[●⎿✻·◼]/;
+/** Matches the "ctrl+o to expand" hint injected by OMC. */
+const CTRL_O_RE = /ctrl\+o to expand/i;
+/** Lines composed entirely of box-drawing characters and whitespace. */
+const BOX_DRAWING_RE = /^[\s─═│║┌┐└┘┬┴├┤╔╗╚╝╠╣╦╩╬╟╢╤╧╪━┃┏┓┗┛┣┫┳┻╋┠┨┯┷┿╂]+$/;
+/** OMC HUD status lines: [OMC#...] or [OMC] (unversioned). */
+const OMC_HUD_RE = /\[OMC[#\]]/;
+/** Bypass-permissions indicator lines starting with ⏵. */
+const BYPASS_PERM_RE = /^⏵/;
+/** Bare shell prompt with no command after it. */
+const BARE_PROMPT_RE = /^[❯>$%#]+$/;
+/** Minimum ratio of alphanumeric characters for a line to be "meaningful". */
+const MIN_ALNUM_RATIO = 0.15;
+/** Default maximum number of meaningful lines to include in a notification.
+ * Matches DEFAULT_TMUX_TAIL_LINES in config.ts. */
+const DEFAULT_MAX_TAIL_LINES = 15;
+/**
+ * Parse raw tmux output into clean, human-readable lines.
+ * - Strips ANSI escape codes
+ * - Drops lines starting with OMC chrome characters (●, ⎿, ✻, ·, ◼)
+ * - Drops "ctrl+o to expand" hint lines
+ * - Returns at most `maxLines` non-empty lines (default 10)
+ */
+export function parseTmuxTail(raw, maxLines = DEFAULT_MAX_TAIL_LINES) {
+    const meaningful = [];
+    for (const line of raw.split("\n")) {
+        const stripped = line.replace(ANSI_ESCAPE_RE, "");
+        const trimmed = stripped.trim();
+        if (!trimmed)
+            continue;
+        if (UI_CHROME_RE.test(trimmed))
+            continue;
+        if (CTRL_O_RE.test(trimmed))
+            continue;
+        if (BOX_DRAWING_RE.test(trimmed))
+            continue;
+        if (OMC_HUD_RE.test(trimmed))
+            continue;
+        if (BYPASS_PERM_RE.test(trimmed))
+            continue;
+        if (BARE_PROMPT_RE.test(trimmed))
+            continue;
+        // Alphanumeric density check: drop lines mostly composed of special characters
+        const alnumCount = (trimmed.match(/[a-zA-Z0-9]/g) || []).length;
+        if (trimmed.length >= 8 && alnumCount / trimmed.length < MIN_ALNUM_RATIO)
+            continue;
+        meaningful.push(stripped.trimEnd());
+    }
+    return meaningful.slice(-maxLines).join("\n");
+}
+/**
+ * Append tmux tail content to a message if present in the payload.
+ */
+function appendTmuxTail(lines, payload) {
+    if (payload.tmuxTail) {
+        const parsed = parseTmuxTail(payload.tmuxTail, payload.maxTailLines);
+        if (parsed) {
+            lines.push("");
+            lines.push("**Recent output:**");
+            lines.push("```");
+            lines.push(parsed);
+            lines.push("```");
+        }
+    }
+}
+/**
+ * Format agent-call notification message.
+ * Sent when a new agent (Task) is spawned.
+ */
+export function formatAgentCall(payload) {
+    const lines = [`# Agent Spawned`, ""];
+    if (payload.agentName) {
+        lines.push(`**Agent:** \`${payload.agentName}\``);
+    }
+    if (payload.agentType) {
+        lines.push(`**Type:** \`${payload.agentType}\``);
     }
     lines.push("");
     lines.push(buildFooter(payload, true));
@@ -159,6 +245,8 @@ export function formatNotification(payload) {
             return formatSessionIdle(payload);
         case "ask-user-question":
             return formatAskUserQuestion(payload);
+        case "agent-call":
+            return formatAgentCall(payload);
         default:
             return payload.message || `Event: ${payload.event}`;
     }

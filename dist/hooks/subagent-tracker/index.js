@@ -8,9 +8,11 @@
  * - HUD integration for agent status display
  * - Automatic cleanup of orphaned agent state
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, statSync, } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync, } from "fs";
 import { join } from "path";
+import { getOmcRoot } from '../../lib/worktree-paths.js';
 import { recordAgentStart, recordAgentStop } from './session-replay.js';
+import { recordMissionAgentStart, recordMissionAgentStop } from '../../hud/mission-board.js';
 export const COST_LIMIT_USD = 1.0;
 export const DEADLOCK_CHECK_THRESHOLD = 3;
 // ============================================================================
@@ -110,8 +112,8 @@ export function mergeTrackerStates(diskState, pendingState) {
  * Acquire file lock with timeout and stale lock detection
  */
 function acquireLock(directory) {
-    const lockPath = join(directory, ".omc", "state", "subagent-tracker.lock");
-    const lockDir = join(directory, ".omc", "state");
+    const lockPath = join(getOmcRoot(directory), "state", "subagent-tracker.lock");
+    const lockDir = join(getOmcRoot(directory), "state");
     if (!existsSync(lockDir)) {
         mkdirSync(lockDir, { recursive: true });
     }
@@ -183,7 +185,7 @@ function acquireLock(directory) {
  * Release file lock
  */
 function releaseLock(directory) {
-    const lockPath = join(directory, ".omc", "state", "subagent-tracker.lock");
+    const lockPath = join(getOmcRoot(directory), "state", "subagent-tracker.lock");
     try {
         unlinkSync(lockPath);
     }
@@ -195,7 +197,7 @@ function releaseLock(directory) {
  * Get the state file path
  */
 export function getStateFilePath(directory) {
-    const stateDir = join(directory, ".omc", "state");
+    const stateDir = join(getOmcRoot(directory), "state");
     if (!existsSync(stateDir)) {
         mkdirSync(stateDir, { recursive: true });
     }
@@ -351,35 +353,22 @@ export function flushPendingWrites() {
  * Detect the current parent mode from state files
  */
 function detectParentMode(directory) {
-    const stateDir = join(directory, ".omc", "state");
+    const stateDir = join(getOmcRoot(directory), "state");
     if (!existsSync(stateDir)) {
         return "none";
     }
     // Check in order of specificity
     const modeFiles = [
-        { file: "ultrapilot-state.json", mode: "ultrapilot" },
         { file: "autopilot-state.json", mode: "autopilot" },
-        { file: "swarm.db", mode: "swarm" },
         { file: "ultrawork-state.json", mode: "ultrawork" },
         { file: "ralph-state.json", mode: "ralph" },
+        { file: "team-state.json", mode: "team" },
     ];
     for (const { file, mode } of modeFiles) {
         const filePath = join(stateDir, file);
         if (existsSync(filePath)) {
-            // Special case for swarm.db - just check existence and size
-            if (file === 'swarm.db') {
-                try {
-                    const stats = statSync(filePath);
-                    if (stats.size > 0) {
-                        return mode;
-                    }
-                }
-                catch {
-                    continue;
-                }
-            }
-            else {
-                // JSON file check (existing logic)
+            {
+                // JSON file check
                 try {
                     const content = readFileSync(filePath, "utf-8");
                     const state = JSON.parse(content);
@@ -442,6 +431,17 @@ export function processSubagentStart(input) {
         // Record to session replay JSONL for /trace
         try {
             recordAgentStart(input.cwd, input.session_id, input.agent_id, input.agent_type, input.prompt, parentMode, input.model);
+        }
+        catch { /* best-effort */ }
+        try {
+            recordMissionAgentStart(input.cwd, {
+                sessionId: input.session_id,
+                agentId: input.agent_id,
+                agentType: input.agent_type,
+                parentMode,
+                taskDescription: input.prompt,
+                at: agentInfo.started_at,
+            });
         }
         catch { /* best-effort */ }
         // Check for stale agents
@@ -513,6 +513,16 @@ export function processSubagentStop(input) {
             const trackedAgent = agentIndex !== -1 ? state.agents[agentIndex] : undefined;
             const agentType = trackedAgent?.agent_type || input.agent_type || 'unknown';
             recordAgentStop(input.cwd, input.session_id, input.agent_id, agentType, succeeded, trackedAgent?.duration_ms);
+        }
+        catch { /* best-effort */ }
+        try {
+            recordMissionAgentStop(input.cwd, {
+                sessionId: input.session_id,
+                agentId: input.agent_id,
+                success: succeeded,
+                outputSummary: agentIndex !== -1 ? state.agents[agentIndex]?.output_summary : input.output,
+                at: agentIndex !== -1 ? state.agents[agentIndex]?.completed_at : new Date().toISOString(),
+            });
         }
         catch { /* best-effort */ }
         const runningCount = state.agents.filter((a) => a.status === "running").length;
@@ -977,13 +987,13 @@ export function updateTokenUsage(directory, agentId, tokens) {
                     cost_usd: 0,
                 };
             }
-            if (tokens.input_tokens)
+            if (tokens.input_tokens !== undefined)
                 agent.token_usage.input_tokens += tokens.input_tokens;
-            if (tokens.output_tokens)
+            if (tokens.output_tokens !== undefined)
                 agent.token_usage.output_tokens += tokens.output_tokens;
-            if (tokens.cache_read_tokens)
+            if (tokens.cache_read_tokens !== undefined)
                 agent.token_usage.cache_read_tokens += tokens.cache_read_tokens;
-            if (tokens.cost_usd)
+            if (tokens.cost_usd !== undefined)
                 agent.token_usage.cost_usd += tokens.cost_usd;
             writeTrackingState(directory, state);
         }

@@ -6,48 +6,27 @@
  *
  * Ported from oh-my-opencode's keyword-detector hook.
  */
-import { isEcomodeEnabled, isTeamEnabled } from '../../features/auto-update.js';
-/**
- * Autopilot keywords
- */
-const AUTOPILOT_KEYWORDS = [
-    'autopilot',
-    'auto pilot',
-    'auto-pilot',
-    'autonomous',
-    'full auto',
-    'fullsend',
-];
-const AUTOPILOT_PHRASE_PATTERNS = [
-    /\bbuild\s+me\s+/i,
-    /\bcreate\s+me\s+/i,
-    /\bmake\s+me\s+/i,
-    /\bi\s+want\s+a\s+/i,
-    /\bi\s+want\s+an\s+/i,
-    /\bhandle\s+it\s+all\b/i,
-    /\bend\s+to\s+end\b/i,
-    /\be2e\s+this\b/i,
-];
+import { classifyTaskSize, isHeavyMode, } from '../task-size-detector/index.js';
 /**
  * Keyword patterns for each mode
  */
 const KEYWORD_PATTERNS = {
     cancel: /\b(cancelomc|stopomc)\b/i,
-    ralph: /\b(ralph|don't stop|must complete|until done)\b/i,
-    autopilot: /\b(autopilot|auto pilot|auto-pilot|autonomous|full auto|fullsend)\b/i,
-    ultrapilot: /\b(ultrapilot|ultra-pilot)\b|\bparallel\s+build\b|\bswarm\s+build\b/i,
-    ultrawork: /\b(ultrawork|ulw|uw)\b/i,
-    ecomode: /\b(eco|ecomode|eco-mode|efficient|save-tokens|budget)\b/i,
-    swarm: /\bswarm\s+\d+\s+agents?\b|\bcoordinated\s+agents\b|\bteam\s+mode\b/i,
-    team: /(?<!\b(?:my|the|our|a|his|her|their|its)\s)\bteam\b|\bcoordinated\s+team\b/i,
-    pipeline: /\b(pipeline)\b|\bchain\s+agents\b/i,
+    ralph: /\b(ralph)\b(?!-)/i,
+    autopilot: /\b(autopilot|auto[\s-]?pilot|fullsend|full\s+auto)\b/i,
+    ultrawork: /\b(ultrawork|ulw)\b/i,
+    // Team keyword detection disabled — team mode is now explicit-only via /team skill.
+    // This prevents infinite spawning when Claude workers receive prompts containing "team".
+    team: /(?!x)x/, // never-match placeholder (type system requires the key)
     ralplan: /\b(ralplan)\b/i,
-    plan: /\bplan\s+(this|the)\b/i,
-    tdd: /\b(tdd)\b|\btest\s+first\b|\bred\s+green\b/i,
-    research: /\b(research)\b|\banalyze\s+data\b|\bstatistics\b/i,
-    ultrathink: /\b(ultrathink|think hard|think deeply)\b/i,
-    deepsearch: /\b(deepsearch)\b|\bsearch\s+(the\s+)?(codebase|code|files?|project)\b|\bfind\s+(in\s+)?(codebase|code|all\s+files?)\b/i,
-    analyze: /\b(deep\s*analyze)\b|\binvestigate\s+(the|this|why)\b|\bdebug\s+(the|this|why)\b/i,
+    tdd: /\b(tdd)\b|\btest\s+first\b/i,
+    'code-review': /\b(code\s+review|review\s+code)\b/i,
+    'security-review': /\b(security\s+review|review\s+security)\b/i,
+    ultrathink: /\b(ultrathink)\b/i,
+    deepsearch: /\b(deepsearch)\b|\bsearch\s+the\s+codebase\b|\bfind\s+in\s+(the\s+)?codebase\b/i,
+    analyze: /\b(deep[\s-]?analyze|deepanalyze)\b/i,
+    'deep-interview': /\b(deep[\s-]interview|ouroboros)\b/i,
+    ccg: /\b(ccg|claude-codex-gemini)\b/i,
     codex: /\b(ask|use|delegate\s+to)\s+(codex|gpt)\b/i,
     gemini: /\b(ask|use|delegate\s+to)\s+gemini\b/i
 };
@@ -55,9 +34,9 @@ const KEYWORD_PATTERNS = {
  * Priority order for keyword detection
  */
 const KEYWORD_PRIORITY = [
-    'cancel', 'ralph', 'autopilot', 'ultrapilot', 'team', 'ultrawork', 'ecomode',
-    'swarm', 'pipeline', 'ralplan', 'plan', 'tdd', 'research',
-    'ultrathink', 'deepsearch', 'analyze', 'codex', 'gemini'
+    'cancel', 'ralph', 'autopilot', 'team', 'ultrawork',
+    'ccg', 'ralplan', 'tdd', 'code-review', 'security-review',
+    'ultrathink', 'deepsearch', 'analyze', 'deep-interview', 'codex', 'gemini'
 ];
 /**
  * Remove code blocks from text to prevent false positives
@@ -72,7 +51,15 @@ export function removeCodeBlocks(text) {
     return result;
 }
 /**
- * Sanitize text for keyword detection by removing structural noise.
+ * Regex matching non-Latin script characters for prompt translation detection.
+ * Uses Unicode script ranges (not raw non-ASCII) to avoid false positives on emoji and accented Latin.
+ * Covers: CJK (Japanese/Chinese), Korean, Cyrillic, Arabic, Devanagari, Thai, Myanmar.
+ */
+export const NON_LATIN_SCRIPT_PATTERN = 
+// eslint-disable-next-line no-misleading-character-class -- Intentional: detecting script presence, not matching grapheme clusters
+/[\u3000-\u9FFF\uAC00-\uD7AF\u0400-\u04FF\u0600-\u06FF\u0900-\u097F\u0E00-\u0E7F\u1000-\u109F]/u;
+/**
+* Sanitize text for keyword detection by removing structural noise.
  * Strips XML tags, URLs, file paths, and code blocks.
  */
 export function sanitizeForKeywordDetection(text) {
@@ -103,40 +90,10 @@ export function extractPromptText(parts) {
 export function detectKeywordsWithType(text, _agentName) {
     const detected = [];
     const cleanedText = sanitizeForKeywordDetection(text);
-    // Check autopilot phrases first (more specific than keywords)
-    for (const pattern of AUTOPILOT_PHRASE_PATTERNS) {
-        const match = cleanedText.match(pattern);
-        if (match && match.index !== undefined) {
-            detected.push({
-                type: 'autopilot',
-                keyword: match[0],
-                position: match.index
-            });
-            break; // Only need one autopilot match
-        }
-    }
-    // Check autopilot keywords
-    for (const keyword of AUTOPILOT_KEYWORDS) {
-        const regex = new RegExp(`\\b${keyword}\\b`, 'i');
-        const match = cleanedText.match(regex);
-        if (match && match.index !== undefined) {
-            // Avoid duplicates from phrase detection
-            const position = cleanedText.toLowerCase().indexOf(keyword.toLowerCase());
-            detected.push({
-                type: 'autopilot',
-                keyword,
-                position: position >= 0 ? position : 0
-            });
-        }
-    }
     // Check each keyword type
     for (const type of KEYWORD_PRIORITY) {
-        // Skip team-related types when team feature is disabled
-        if ((type === 'team' || type === 'ultrapilot' || type === 'swarm') && !isTeamEnabled()) {
-            continue;
-        }
-        // Skip ecomode detection if disabled in config
-        if (type === 'ecomode' && !isEcomodeEnabled()) {
+        // Team keyword detection disabled — team mode is now explicit-only via /team skill
+        if (type === 'team') {
             continue;
         }
         const pattern = KEYWORD_PATTERNS[type];
@@ -147,14 +104,6 @@ export function detectKeywordsWithType(text, _agentName) {
                 keyword: match[0],
                 position: match.index
             });
-            // Legacy ultrapilot/swarm also activate team mode internally
-            if (type === 'ultrapilot' || type === 'swarm') {
-                detected.push({
-                    type: 'team',
-                    keyword: match[0],
-                    position: match.index
-                });
-            }
         }
     }
     return detected;
@@ -176,16 +125,45 @@ export function getAllKeywords(text) {
     // Exclusive: cancel suppresses everything
     if (types.includes('cancel'))
         return ['cancel'];
-    // Mutual exclusion: ecomode beats ultrawork (only if ecomode is enabled)
-    if (types.includes('ecomode') && types.includes('ultrawork') && isEcomodeEnabled()) {
-        types = types.filter(t => t !== 'ultrawork');
-    }
-    // Mutual exclusion: team beats autopilot (ultrapilot/swarm now map to team at detection)
+    // Mutual exclusion: team beats autopilot
     if (types.includes('team') && types.includes('autopilot')) {
         types = types.filter(t => t !== 'autopilot');
     }
     // Sort by priority order
     return KEYWORD_PRIORITY.filter(k => types.includes(k));
+}
+/**
+ * Get all keywords with task-size-based filtering applied.
+ * For small tasks, heavy orchestration modes (ralph/autopilot/team/ultrawork etc.)
+ * are suppressed to avoid over-orchestration.
+ *
+ * This is the recommended function to use in the bridge hook for keyword detection.
+ */
+export function getAllKeywordsWithSizeCheck(text, options = {}) {
+    const { enabled = true, smallWordLimit = 50, largeWordLimit = 200, suppressHeavyModesForSmallTasks = true, } = options;
+    const keywords = getAllKeywords(text);
+    if (!enabled || !suppressHeavyModesForSmallTasks || keywords.length === 0) {
+        return { keywords, taskSizeResult: null, suppressedKeywords: [] };
+    }
+    const thresholds = { smallWordLimit, largeWordLimit };
+    const taskSizeResult = classifyTaskSize(text, thresholds);
+    // Only suppress heavy modes for small tasks
+    if (taskSizeResult.size !== 'small') {
+        return { keywords, taskSizeResult, suppressedKeywords: [] };
+    }
+    const suppressedKeywords = [];
+    const filteredKeywords = keywords.filter(keyword => {
+        if (isHeavyMode(keyword)) {
+            suppressedKeywords.push(keyword);
+            return false;
+        }
+        return true;
+    });
+    return {
+        keywords: filteredKeywords,
+        taskSizeResult,
+        suppressedKeywords,
+    };
 }
 /**
  * Get the highest priority keyword detected with conflict resolution
@@ -201,5 +179,118 @@ export function getPrimaryKeyword(text) {
     const detected = detectKeywordsWithType(text);
     const match = detected.find(d => d.type === primaryType);
     return match || null;
+}
+/**
+ * Execution mode keywords subject to the ralplan-first gate (issue #997).
+ * These modes spin up heavy orchestration and should not run on vague requests.
+ */
+export const EXECUTION_GATE_KEYWORDS = new Set([
+    'ralph',
+    'autopilot',
+    'team',
+    'ultrawork',
+]);
+/**
+ * Escape hatch prefixes that bypass the ralplan gate.
+ */
+const GATE_BYPASS_PREFIXES = ['force:', '!'];
+/**
+ * Positive signals that the prompt IS well-specified enough for direct execution.
+ * If ANY of these are present, the prompt auto-passes the gate (fast path).
+ */
+const WELL_SPECIFIED_SIGNALS = [
+    // References specific files by extension
+    /\b[\w/.-]+\.(?:ts|js|py|go|rs|java|tsx|jsx|vue|svelte|rb|c|cpp|h|css|scss|html|json|yaml|yml|toml)\b/,
+    // References specific paths with directory separators
+    /(?:src|lib|test|spec|app|pages|components|hooks|utils|services|api|dist|build|scripts)\/\w+/,
+    // References specific functions/classes/methods by keyword
+    /\b(?:function|class|method|interface|type|const|let|var|def|fn|struct|enum)\s+\w{2,}/i,
+    // CamelCase identifiers (likely symbol names: processKeyword, getUserById)
+    /\b[a-z]+(?:[A-Z][a-z]+)+\b/,
+    // PascalCase identifiers (likely class/type names: KeywordDetector, UserModel)
+    /\b[A-Z][a-z]+(?:[A-Z][a-z0-9]*)+\b/,
+    // snake_case identifiers with 2+ segments (likely symbol names: user_model, get_user)
+    /\b[a-z]+(?:_[a-z]+)+\b/,
+    // Bare issue/PR number (#123, #42)
+    /(?:^|\s)#\d+\b/,
+    // Has numbered steps or bullet list (structured request)
+    /(?:^|\n)\s*(?:\d+[.)]\s|-\s+\S|\*\s+\S)/m,
+    // Has acceptance criteria or test spec keywords
+    /\b(?:acceptance\s+criteria|test\s+(?:spec|plan|case)|should\s+(?:return|throw|render|display|create|delete|update))\b/i,
+    // Has specific error or issue reference
+    /\b(?:error:|bug\s*#?\d+|issue\s*#\d+|stack\s*trace|exception|TypeError|ReferenceError|SyntaxError)\b/i,
+    // Has a code block with substantial content.
+    // NOTE: In the bridge.ts integration, cleanedText has code blocks pre-stripped by
+    // removeCodeBlocks(), so this regex will not match there. It remains useful for
+    // direct callers of isUnderspecifiedForExecution() that pass raw prompt text.
+    /```[\s\S]{20,}?```/,
+    // PR or commit reference
+    /\b(?:PR\s*#\d+|commit\s+[0-9a-f]{7}|pull\s+request)\b/i,
+    // "in <specific-path>" pattern
+    /\bin\s+[\w/.-]+\.(?:ts|js|py|go|rs|java|tsx|jsx)\b/,
+    // Test runner commands (explicit test target)
+    /\b(?:npm\s+test|npx\s+(?:vitest|jest)|pytest|cargo\s+test|go\s+test|make\s+test)\b/i,
+];
+/**
+ * Check if a prompt is underspecified for direct execution.
+ * Returns true if the prompt lacks enough specificity for heavy execution modes.
+ *
+ * Conservative: only gates clearly vague prompts. Borderline cases pass through.
+ */
+export function isUnderspecifiedForExecution(text) {
+    const trimmed = text.trim();
+    if (!trimmed)
+        return true;
+    // Escape hatch: force: or ! prefix bypasses the gate
+    for (const prefix of GATE_BYPASS_PREFIXES) {
+        if (trimmed.startsWith(prefix))
+            return false;
+    }
+    // If any well-specified signal is present, pass through
+    if (WELL_SPECIFIED_SIGNALS.some(p => p.test(trimmed)))
+        return false;
+    // Strip mode keywords for effective word counting
+    const stripped = trimmed
+        .replace(/\b(?:ralph|autopilot|team|ultrawork|ulw)\b/gi, '')
+        .trim();
+    const effectiveWords = stripped.split(/\s+/).filter(w => w.length > 0).length;
+    // Short prompts without well-specified signals are underspecified
+    if (effectiveWords <= 15)
+        return true;
+    return false;
+}
+/**
+ * Apply the ralplan-first gate (issue #997): if execution keywords are present
+ * but the prompt is underspecified, redirect to ralplan.
+ *
+ * Returns the modified keyword list and gate metadata.
+ */
+export function applyRalplanGate(keywords, text) {
+    if (keywords.length === 0) {
+        return { keywords, gateApplied: false, gatedKeywords: [] };
+    }
+    // Don't gate if cancel is present (cancel always wins)
+    if (keywords.includes('cancel')) {
+        return { keywords, gateApplied: false, gatedKeywords: [] };
+    }
+    // Don't gate if ralplan is already in the list
+    if (keywords.includes('ralplan')) {
+        return { keywords, gateApplied: false, gatedKeywords: [] };
+    }
+    // Check if any execution keywords are present
+    const executionKeywords = keywords.filter(k => EXECUTION_GATE_KEYWORDS.has(k));
+    if (executionKeywords.length === 0) {
+        return { keywords, gateApplied: false, gatedKeywords: [] };
+    }
+    // Check if prompt is underspecified
+    if (!isUnderspecifiedForExecution(text)) {
+        return { keywords, gateApplied: false, gatedKeywords: [] };
+    }
+    // Gate: replace execution keywords with ralplan
+    const filtered = keywords.filter(k => !EXECUTION_GATE_KEYWORDS.has(k));
+    if (!filtered.includes('ralplan')) {
+        filtered.push('ralplan');
+    }
+    return { keywords: filtered, gateApplied: true, gatedKeywords: executionKeywords };
 }
 //# sourceMappingURL=index.js.map

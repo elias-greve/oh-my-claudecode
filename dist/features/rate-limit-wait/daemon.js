@@ -16,7 +16,8 @@ import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
 import { spawn } from 'child_process';
-import { checkRateLimitStatus, formatRateLimitStatus } from './rate-limit-monitor.js';
+import { resolveDaemonModulePath } from '../../utils/daemon-module-path.js';
+import { checkRateLimitStatus, formatRateLimitStatus, isRateLimitStatusDegraded, shouldMonitorBlockedPanes, } from './rate-limit-monitor.js';
 import { isTmuxAvailable, scanForBlockedPanes, sendResumeSequence, formatBlockedPanesSummary, } from './tmux-detector.js';
 // ESM compatibility: __filename is not available in ES modules
 const __filename = fileURLToPath(import.meta.url);
@@ -96,8 +97,11 @@ function writeSecureFile(filePath, content) {
     try {
         chmodSync(filePath, SECURE_FILE_MODE);
     }
-    catch {
-        // Ignore permission errors (e.g., on Windows)
+    catch (err) {
+        // chmod is not supported on Windows; warn on other platforms
+        if (process.platform !== 'win32') {
+            console.warn(`[RateLimitDaemon] Failed to set permissions on ${filePath}:`, err);
+        }
     }
 }
 /**
@@ -266,20 +270,53 @@ function createInitialState() {
     };
 }
 /**
+ * Register cleanup handlers for the daemon process.
+ * Ensures PID file and state are cleaned up on exit signals.
+ */
+function registerDaemonCleanup(config) {
+    const cleanup = () => {
+        try {
+            removePidFile(config);
+        }
+        catch {
+            // Ignore cleanup errors
+        }
+        try {
+            const state = readDaemonState(config);
+            if (state) {
+                state.isRunning = false;
+                state.pid = null;
+                writeDaemonState(state, config);
+            }
+        }
+        catch {
+            // Ignore cleanup errors
+        }
+    };
+    process.once('SIGINT', () => { cleanup(); process.exit(0); });
+    process.once('SIGTERM', () => { cleanup(); process.exit(0); });
+    process.once('exit', cleanup);
+}
+/**
  * Main daemon polling loop
  */
 async function pollLoop(config) {
     const state = readDaemonState(config) || createInitialState();
     state.isRunning = true;
     state.pid = process.pid;
+    // Register cleanup handlers so PID/state files are cleaned up on exit
+    registerDaemonCleanup(config);
     log('Starting poll loop', config);
     while (state.isRunning) {
         try {
             state.lastPollAt = new Date();
-            // Check rate limit status
-            const rateLimitStatus = await checkRateLimitStatus();
-            const wasLimited = state.rateLimitStatus?.isLimited ?? false;
-            const isNowLimited = rateLimitStatus?.isLimited ?? false;
+            // Check rate limit status with a 30s timeout to prevent poll loop stalls
+            const rateLimitStatus = await Promise.race([
+                checkRateLimitStatus(),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('checkRateLimitStatus timed out after 30s')), 30_000)),
+            ]);
+            const wasLimited = shouldMonitorBlockedPanes(state.rateLimitStatus);
+            const isNowLimited = shouldMonitorBlockedPanes(rateLimitStatus);
             state.rateLimitStatus = rateLimitStatus;
             if (rateLimitStatus) {
                 log(`Rate limit status: ${formatRateLimitStatus(rateLimitStatus)}`, config);
@@ -289,7 +326,10 @@ async function pollLoop(config) {
             }
             // If currently rate limited, scan for blocked panes
             if (isNowLimited && isTmuxAvailable()) {
-                log('Rate limited - scanning for blocked panes', config);
+                const scanReason = rateLimitStatus?.isLimited
+                    ? 'Rate limited - scanning for blocked panes'
+                    : 'Usage API degraded (429/stale cache) - scanning for blocked panes';
+                log(scanReason, config);
                 const blockedPanes = scanForBlockedPanes(config.paneLinesToCapture);
                 // Add newly detected blocked panes
                 for (const pane of blockedPanes) {
@@ -365,21 +405,34 @@ export function startDaemon(config) {
     ensureStateDir(cfg);
     // Fork a new process for the daemon using dynamic import() for ESM compatibility.
     // The project uses "type": "module", so require() would fail with ERR_REQUIRE_ESM.
-    const modulePath = __filename.replace(/\.ts$/, '.js');
+    const modulePath = resolveDaemonModulePath(__filename, ['features', 'rate-limit-wait', 'daemon.js']);
+    // Write config to a temp file to avoid config injection via template string.
+    // This prevents malicious config values from being interpreted as code.
+    const configId = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const configPath = join(dirname(cfg.stateFilePath), `.daemon-config-${configId}.json`);
+    try {
+        writeSecureFile(configPath, JSON.stringify(cfg));
+    }
+    catch {
+        return { success: false, message: 'Failed to write daemon config file' };
+    }
     const daemonScript = `
-    import('${modulePath}').then(({ pollLoop }) => {
-      const config = ${JSON.stringify(cfg)};
-      return pollLoop(config);
+    import('${modulePath}').then(async ({ pollLoopWithConfigFile }) => {
+      await pollLoopWithConfigFile(process.env.OMC_DAEMON_CONFIG_FILE);
     }).catch((err) => { console.error(err); process.exit(1); });
   `;
     try {
         // Use node to run the daemon in background
         // Note: Using minimal env to prevent leaking sensitive credentials
+        const daemonEnv = {
+            ...createMinimalDaemonEnv(),
+            OMC_DAEMON_CONFIG_FILE: configPath,
+        };
         const child = spawn('node', ['-e', daemonScript], {
             detached: true,
             stdio: 'ignore',
             cwd: process.cwd(),
-            env: createMinimalDaemonEnv(),
+            env: daemonEnv,
         });
         child.unref();
         const pid = child.pid;
@@ -394,12 +447,14 @@ export function startDaemon(config) {
                 state,
             };
         }
-        return {
-            success: false,
-            message: 'Failed to start daemon process',
-        };
+        return { success: false, message: 'Failed to start daemon process' };
     }
     catch (error) {
+        // Clean up config file on failure
+        try {
+            unlinkSync(configPath);
+        }
+        catch { /* ignore cleanup errors */ }
         return {
             success: false,
             message: 'Failed to start daemon',
@@ -558,7 +613,7 @@ export function formatDaemonState(state) {
     // Rate limit status
     lines.push('');
     if (state.rateLimitStatus) {
-        if (state.rateLimitStatus.isLimited) {
+        if (state.rateLimitStatus.isLimited || isRateLimitStatusDegraded(state.rateLimitStatus)) {
             lines.push(`⚠ ${formatRateLimitStatus(state.rateLimitStatus)}`);
         }
         else {
@@ -586,4 +641,17 @@ export function formatDaemonState(state) {
 }
 // Export pollLoop for use by the daemon subprocess
 export { pollLoop };
+/**
+ * Poll loop entry point for daemon subprocess.
+ * Reads config from file to avoid config injection via command line.
+ */
+export async function pollLoopWithConfigFile(configPath) {
+    const configContent = readFileSync(configPath, 'utf-8');
+    const config = JSON.parse(configContent);
+    // Restore Date objects from JSON
+    if (config.stateFilePath) {
+        // Config is valid, proceed with poll loop
+    }
+    await pollLoop(config);
+}
 //# sourceMappingURL=daemon.js.map

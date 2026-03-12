@@ -12,6 +12,9 @@ import { homedir } from 'os';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { readStdin } from './lib/stdin.mjs';
 
+const AGENT_OUTPUT_ANALYSIS_LIMIT = parseInt(process.env.OMC_AGENT_OUTPUT_ANALYSIS_LIMIT || '12000', 10);
+const AGENT_OUTPUT_SUMMARY_LIMIT = parseInt(process.env.OMC_AGENT_OUTPUT_SUMMARY_LIMIT || '360', 10);
+
 // Get the directory of this script to resolve the dist module
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -125,8 +128,59 @@ function appendToBashHistory(command) {
   }
 }
 
+// Pattern to match Claude Code temp CWD permission errors (false positives on macOS)
+// e.g. "zsh:1: permission denied: /var/folders/.../T/claude-abc123-cwd"
+const CLAUDE_TEMP_CWD_PATTERN = /zsh:\d+: permission denied:.*\/T\/claude-[a-z0-9]+-cwd/gi;
+
+// Strip Claude Code temp CWD noise before pattern matching
+function stripClaudeTempCwdErrors(output) {
+  return output.replace(CLAUDE_TEMP_CWD_PATTERN, '');
+}
+
+// Pattern matching Claude Code's "Error: Exit code N" prefix line
+const CLAUDE_EXIT_CODE_PREFIX = /^Error: Exit code \d+\s*$/gm;
+
+/**
+ * Detect non-zero exit code with valid stdout (issue #960).
+ * Returns true when output has Claude Code's "Error: Exit code N" prefix
+ * AND substantial content that doesn't itself indicate real errors.
+ * Example: `gh pr checks` exits 8 (pending) but outputs valid CI status.
+ */
+export function isNonZeroExitWithOutput(output) {
+  if (!output) return false;
+  const cleaned = stripClaudeTempCwdErrors(output);
+
+  // Must contain Claude Code's exit code prefix
+  if (!CLAUDE_EXIT_CODE_PREFIX.test(cleaned)) return false;
+  // Reset regex state (global flag)
+  CLAUDE_EXIT_CODE_PREFIX.lastIndex = 0;
+
+  // Strip exit code prefix line(s) and check remaining content
+  const remaining = cleaned.replace(CLAUDE_EXIT_CODE_PREFIX, '').trim();
+  CLAUDE_EXIT_CODE_PREFIX.lastIndex = 0;
+
+  // Must have at least one non-empty line of real output
+  const contentLines = remaining.split('\n').filter(l => l.trim().length > 0);
+  if (contentLines.length === 0) return false;
+
+  // If remaining content has its own error indicators, it's a real failure
+  const contentErrorPatterns = [
+    /error:/i,
+    /failed/i,
+    /cannot/i,
+    /permission denied/i,
+    /command not found/i,
+    /no such file/i,
+    /fatal:/i,
+    /abort/i,
+  ];
+
+  return !contentErrorPatterns.some(p => p.test(remaining));
+}
+
 // Detect failures in Bash output
-function detectBashFailure(output) {
+export function detectBashFailure(output) {
+  const cleaned = stripClaudeTempCwdErrors(output);
   const errorPatterns = [
     /error:/i,
     /failed/i,
@@ -140,7 +194,7 @@ function detectBashFailure(output) {
     /abort/i,
   ];
 
-  return errorPatterns.some(pattern => pattern.test(output));
+  return errorPatterns.some(pattern => pattern.test(cleaned));
 }
 
 // Detect background operation
@@ -155,6 +209,36 @@ function detectBackgroundOperation(output) {
   ];
 
   return bgPatterns.some(pattern => pattern.test(output));
+}
+
+export function summarizeAgentResult(output, maxChars = AGENT_OUTPUT_SUMMARY_LIMIT) {
+  if (!output || typeof output !== 'string') return '';
+
+  const normalized = output
+    .replace(/\r/g, '')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean)
+    .slice(0, 6)
+    .join(' | ');
+
+  if (!normalized) return '';
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 20)).trimEnd()} … [truncated]`;
+}
+
+function clipToolOutputForAnalysis(toolName, output) {
+  if (typeof output !== 'string') return { clipped: '', wasTruncated: false };
+
+  const isAgentResultTool = toolName === 'Task' || toolName === 'TaskCreate' || toolName === 'TaskUpdate' || toolName === 'TaskOutput';
+  if (!isAgentResultTool || output.length <= AGENT_OUTPUT_ANALYSIS_LIMIT) {
+    return { clipped: output, wasTruncated: false };
+  }
+
+  return {
+    clipped: `${output.slice(0, AGENT_OUTPUT_ANALYSIS_LIMIT)}\n...[agent output truncated by OMC context guard]`,
+    wasTruncated: true,
+  };
 }
 
 /**
@@ -196,16 +280,22 @@ function processRememberTags(output, directory) {
 }
 
 // Detect write failure
-function detectWriteFailure(output) {
+// Patterns are tightened to tool-level failure phrases to avoid false positives
+// when edited file content contains error-handling code (issue #1005)
+export function detectWriteFailure(output) {
+  const cleaned = stripClaudeTempCwdErrors(output);
   const errorPatterns = [
-    /error/i,
-    /failed/i,
-    /permission denied/i,
-    /read-only/i,
-    /not found/i,
+    /\berror:/i,              // "error:" with word boundary — avoids "setError", "console.error"
+    /\bfailed to\b/i,        // "failed to write" — avoids "failedOidc", UI strings
+    /\bwrite failed\b/i,     // explicit write failure
+    /\boperation failed\b/i, // explicit operation failure
+    /permission denied/i,    // keep as-is (specific enough)
+    /read-only/i,            // keep as-is
+    /\bno such file\b/i,     // more specific than "not found"
+    /\bdirectory not found\b/i,
   ];
 
-  return errorPatterns.some(pattern => pattern.test(output));
+  return errorPatterns.some(pattern => pattern.test(cleaned));
 }
 
 // Get agent completion summary from tracking state
@@ -235,12 +325,18 @@ function getAgentCompletionSummary(directory) {
 }
 
 // Generate contextual message
-function generateMessage(toolName, toolOutput, sessionId, toolCount, directory) {
+function generateMessage(toolName, toolOutput, sessionId, toolCount, directory, options = {}) {
+  const { wasTruncated = false, rawLength = 0 } = options;
   let message = '';
 
   switch (toolName) {
     case 'Bash':
-      if (detectBashFailure(toolOutput)) {
+      if (isNonZeroExitWithOutput(toolOutput)) {
+        // Non-zero exit with valid output — warning, not error (issue #960)
+        const exitMatch = toolOutput.match(/Exit code (\d+)/);
+        const code = exitMatch ? exitMatch[1] : 'non-zero';
+        message = `Command exited with code ${code} but produced valid output. This may be expected behavior.`;
+      } else if (detectBashFailure(toolOutput)) {
         message = 'Command failed. Please investigate the error and fix before continuing.';
       } else if (detectBackgroundOperation(toolOutput)) {
         message = 'Background operation detected. Remember to verify results before proceeding.';
@@ -258,8 +354,24 @@ function generateMessage(toolName, toolOutput, sessionId, toolCount, directory) 
       } else if (toolCount > 5) {
         message = `Multiple tasks delegated (${toolCount} total). Track their completion status.`;
       }
+      if (wasTruncated) {
+        const truncationNote = `Agent result stream clipped for context safety (${rawLength} chars). Synthesize only key outcomes in main session.`;
+        message = message ? `${message} | ${truncationNote}` : truncationNote;
+      }
       if (agentSummary) {
         message = message ? `${message} | ${agentSummary}` : agentSummary;
+      }
+      break;
+    }
+
+    case 'TaskOutput': {
+      const summary = summarizeAgentResult(toolOutput);
+      if (summary) {
+        message = `TaskOutput summary: ${summary}`;
+      }
+      if (wasTruncated) {
+        const truncationNote = `TaskOutput clipped (${rawLength} chars). Continue with concise synthesis and defer full logs to files.`;
+        message = message ? `${message} | ${truncationNote}` : truncationNote;
       }
       break;
     }
@@ -313,6 +425,13 @@ function generateMessage(toolName, toolOutput, sessionId, toolCount, directory) 
 }
 
 async function main() {
+  // Skip guard: check OMC_SKIP_HOOKS env var (see issue #838)
+  const _skipHooks = (process.env.OMC_SKIP_HOOKS || '').split(',').map(s => s.trim());
+  if (process.env.DISABLE_OMC === '1' || _skipHooks.includes('post-tool-use')) {
+    console.log(JSON.stringify({ continue: true }));
+    return;
+  }
+
   try {
     const input = await readStdin();
     const data = JSON.parse(input);
@@ -320,6 +439,7 @@ async function main() {
     const toolName = data.tool_name || data.toolName || '';
     const rawResponse = data.tool_response || data.toolOutput || '';
     const toolOutput = typeof rawResponse === 'string' ? rawResponse : JSON.stringify(rawResponse);
+    const { clipped: clippedToolOutput, wasTruncated } = clipToolOutputForAnalysis(toolName, toolOutput);
     const sessionId = data.session_id || data.sessionId || 'unknown';
     const directory = data.cwd || data.directory || process.cwd();
 
@@ -340,11 +460,14 @@ async function main() {
       toolName === 'TaskCreate' ||
       toolName === 'TaskUpdate'
     ) {
-      processRememberTags(toolOutput, directory);
+      processRememberTags(clippedToolOutput, directory);
     }
 
     // Generate contextual message
-    const message = generateMessage(toolName, toolOutput, sessionId, toolCount, directory);
+    const message = generateMessage(toolName, clippedToolOutput, sessionId, toolCount, directory, {
+      wasTruncated,
+      rawLength: toolOutput.length,
+    });
 
     // Build response - use hookSpecificOutput.additionalContext for PostToolUse
     const response = { continue: true };
@@ -364,4 +487,7 @@ async function main() {
   }
 }
 
-main();
+// Only run when executed directly (not when imported for testing)
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main();
+}

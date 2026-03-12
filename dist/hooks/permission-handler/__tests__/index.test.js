@@ -277,10 +277,25 @@ describe('permission-handler', () => {
             fs.writeFileSync(path.join(stateDir, 'autopilot-state.json'), 'invalid json {');
             expect(isActiveModeRunning(testDir)).toBe(false);
         });
-        it('should return true when swarm marker exists', () => {
+        it('should return false when only obsolete swarm marker exists (#1131)', () => {
             fs.mkdirSync(stateDir, { recursive: true });
             fs.writeFileSync(path.join(stateDir, 'swarm-active.marker'), '');
+            expect(isActiveModeRunning(testDir)).toBe(false);
+        });
+        it('should return true when team mode is active', () => {
+            fs.mkdirSync(stateDir, { recursive: true });
+            fs.writeFileSync(path.join(stateDir, 'team-state.json'), JSON.stringify({ active: true }));
             expect(isActiveModeRunning(testDir)).toBe(true);
+        });
+        it('should return true when team mode status is running', () => {
+            fs.mkdirSync(stateDir, { recursive: true });
+            fs.writeFileSync(path.join(stateDir, 'team-state.json'), JSON.stringify({ status: 'running' }));
+            expect(isActiveModeRunning(testDir)).toBe(true);
+        });
+        it('should return false when team mode is explicitly inactive', () => {
+            fs.mkdirSync(stateDir, { recursive: true });
+            fs.writeFileSync(path.join(stateDir, 'team-state.json'), JSON.stringify({ active: false, status: 'idle' }));
+            expect(isActiveModeRunning(testDir)).toBe(false);
         });
     });
     describe('processPermissionRequest', () => {

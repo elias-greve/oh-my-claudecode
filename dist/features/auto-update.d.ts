@@ -53,12 +53,23 @@ export interface StopCallbackDiscordConfig {
     tagList?: string[];
 }
 /**
+ * Stop hook callback configuration for Slack
+ */
+export interface StopCallbackSlackConfig {
+    enabled: boolean;
+    /** Slack incoming webhook URL */
+    webhookUrl?: string;
+    /** Optional tags/mentions to include in notifications */
+    tagList?: string[];
+}
+/**
  * Stop hook callbacks configuration
  */
 export interface StopHookCallbacksConfig {
     file?: StopCallbackFileConfig;
     telegram?: StopCallbackTelegramConfig;
     discord?: StopCallbackDiscordConfig;
+    slack?: StopCallbackSlackConfig;
 }
 /**
  * OMC configuration (stored in .omc-config.json)
@@ -79,13 +90,6 @@ export interface OMCConfig {
         /** Inject usage instructions at session start (default: true) */
         injectInstructions?: boolean;
     };
-    /** Preferred execution mode for parallel work (set by omc-setup Step 3.7) */
-    defaultExecutionMode?: 'ultrawork' | 'ecomode';
-    /** Ecomode-specific configuration */
-    ecomode?: {
-        /** Whether ecomode is enabled (default: true). Set to false to disable ecomode completely. */
-        enabled?: boolean;
-    };
     /** Whether initial setup has been completed (ISO timestamp) */
     setupCompleted?: string;
     /** Version of setup wizard that was completed */
@@ -94,11 +98,16 @@ export interface OMCConfig {
     stopHookCallbacks?: StopHookCallbacksConfig;
     /** Multi-platform lifecycle notification configuration */
     notifications?: NotificationConfig;
+    /** Named notification profiles (keyed by profile name) */
+    notificationProfiles?: Record<string, NotificationConfig>;
     /** Whether HUD statusline is enabled (default: true). Set to false to skip HUD installation. */
     hudEnabled?: boolean;
     /** Whether to prompt for upgrade at session start when a new version is available (default: true).
      *  Set to false to show a passive notification instead of an interactive prompt. */
     autoUpgradePrompt?: boolean;
+    /** Absolute path to the Node.js binary detected at setup time.
+     *  Used by find-node.sh so hooks work for nvm/fnm users where node is not on PATH. */
+    nodeBinary?: string;
 }
 /**
  * Read the OMC configuration
@@ -113,11 +122,6 @@ export declare function isSilentAutoUpdateEnabled(): boolean;
  * Returns true by default - users must explicitly opt out
  */
 export declare function isAutoUpgradePromptEnabled(): boolean;
-/**
- * Check if ecomode is enabled
- * Returns true by default if not explicitly disabled
- */
-export declare function isEcomodeEnabled(): boolean;
 /**
  * Check if team feature is enabled
  * Returns false by default - requires explicit opt-in

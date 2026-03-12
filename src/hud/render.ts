@@ -7,6 +7,7 @@
 import type { HudRenderContext, HudConfig } from './types.js';
 import { DEFAULT_HUD_CONFIG } from './types.js';
 import { bold, dim } from './colors.js';
+import { stringWidth, getCharWidth } from '../utils/string-width.js';
 import { renderRalph } from './elements/ralph.js';
 import { renderAgentsByFormat, renderAgentsMultiLine } from './elements/agents.js';
 import { renderTodosWithCurrent } from './elements/todos.js';
@@ -14,23 +15,156 @@ import { renderSkills, renderLastSkill } from './elements/skills.js';
 import { renderContext, renderContextWithBar } from './elements/context.js';
 import { renderBackground } from './elements/background.js';
 import { renderPrd } from './elements/prd.js';
-import { renderRateLimits, renderRateLimitsWithBar } from './elements/limits.js';
+import { renderRateLimits, renderRateLimitsWithBar, renderRateLimitsError, renderCustomBuckets } from './elements/limits.js';
 import { renderPermission } from './elements/permission.js';
 import { renderThinking } from './elements/thinking.js';
 import { renderSession } from './elements/session.js';
+import { renderPromptTime } from './elements/prompt-time.js';
 import { renderAutopilot } from './elements/autopilot.js';
 import { renderCwd } from './elements/cwd.js';
 import { renderGitRepo, renderGitBranch } from './elements/git.js';
 import { renderModel } from './elements/model.js';
-import {
-  getAnalyticsDisplay,
-  renderAnalyticsLineWithConfig,
-  getSessionInfo,
-  getSessionHealthAnalyticsData,
-  renderBudgetWarning,
-  renderCacheEfficiency
-} from './analytics-display.js';
-import type { SessionHealth, HudElementConfig } from './types.js';
+import { renderApiKeySource } from './elements/api-key-source.js';
+import { renderCallCounts } from './elements/call-counts.js';
+import { renderContextLimitWarning } from './elements/context-warning.js';
+import { renderMissionBoard } from './mission-board.js';
+
+/**
+ * ANSI escape sequence regex (matches SGR and other CSI sequences).
+ * Used to skip escape codes when measuring/truncating visible width.
+ */
+const ANSI_REGEX = /\x1b\[[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07/;
+
+
+const PLAIN_SEPARATOR = ' | ';
+const DIM_SEPARATOR = dim(PLAIN_SEPARATOR);
+
+/**
+ * Truncate a single line to a maximum visual width, preserving ANSI escape codes.
+ * When the visible content exceeds maxWidth columns, it is truncated with an ellipsis.
+ *
+ * @param line - The line to truncate (may contain ANSI codes)
+ * @param maxWidth - Maximum visual width in terminal columns
+ * @returns Truncated line that fits within maxWidth visible columns
+ */
+export function truncateLineToMaxWidth(line: string, maxWidth: number): string {
+  if (maxWidth <= 0) return '';
+  if (stringWidth(line) <= maxWidth) return line;
+
+  const ELLIPSIS = '...';
+  const ellipsisWidth = 3;
+  const targetWidth = Math.max(0, maxWidth - ellipsisWidth);
+
+  let visibleWidth = 0;
+  let result = '';
+  let hasAnsi = false;
+  let i = 0;
+
+  while (i < line.length) {
+    // Check for ANSI escape sequence at current position
+    const remaining = line.slice(i);
+    const ansiMatch = remaining.match(ANSI_REGEX);
+
+    if (ansiMatch && ansiMatch.index === 0) {
+      // Pass through the entire ANSI sequence without counting width
+      result += ansiMatch[0];
+      hasAnsi = true;
+      i += ansiMatch[0].length;
+      continue;
+    }
+
+    // Read the full code point (handles surrogate pairs for astral-plane chars like emoji)
+    const codePoint = line.codePointAt(i)!;
+    const codeUnits = codePoint > 0xFFFF ? 2 : 1;
+    const char = line.slice(i, i + codeUnits);
+    const charWidth = getCharWidth(char);
+
+    if (visibleWidth + charWidth > targetWidth) break;
+
+    result += char;
+    visibleWidth += charWidth;
+    i += codeUnits;
+  }
+
+  // Append ANSI reset before ellipsis if any escape codes were seen,
+  // to prevent color/style bleed into subsequent terminal output
+  const reset = hasAnsi ? '\x1b[0m' : '';
+  return result + reset + ELLIPSIS;
+}
+
+/**
+ * Wrap a single line at HUD separator boundaries so each wrapped line
+ * fits within maxWidth visible columns.
+ *
+ * Falls back to truncation when:
+ * - no separator is present
+ * - any single segment exceeds maxWidth
+ */
+function wrapLineToMaxWidth(line: string, maxWidth: number): string[] {
+  if (maxWidth <= 0) return [''];
+  if (stringWidth(line) <= maxWidth) return [line];
+
+  const separator = line.includes(DIM_SEPARATOR)
+    ? DIM_SEPARATOR
+    : line.includes(PLAIN_SEPARATOR)
+      ? PLAIN_SEPARATOR
+      : null;
+
+  if (!separator) {
+    return [truncateLineToMaxWidth(line, maxWidth)];
+  }
+
+  const segments = line.split(separator);
+  if (segments.length <= 1) {
+    return [truncateLineToMaxWidth(line, maxWidth)];
+  }
+
+  const wrapped: string[] = [];
+  let current = segments[0] ?? '';
+
+  for (let i = 1; i < segments.length; i += 1) {
+    const nextSegment = segments[i] ?? '';
+    const candidate = `${current}${separator}${nextSegment}`;
+
+    if (stringWidth(candidate) <= maxWidth) {
+      current = candidate;
+      continue;
+    }
+
+    if (stringWidth(current) > maxWidth) {
+      wrapped.push(truncateLineToMaxWidth(current, maxWidth));
+    } else {
+      wrapped.push(current);
+    }
+
+    current = nextSegment;
+  }
+
+  if (stringWidth(current) > maxWidth) {
+    wrapped.push(truncateLineToMaxWidth(current, maxWidth));
+  } else {
+    wrapped.push(current);
+  }
+
+  return wrapped;
+}
+
+/**
+ * Apply maxWidth behavior by mode.
+ */
+function applyMaxWidthByMode(
+  lines: string[],
+  maxWidth: number | undefined,
+  wrapMode: 'truncate' | 'wrap' | undefined
+): string[] {
+  if (!maxWidth || maxWidth <= 0) return lines;
+
+  if (wrapMode === 'wrap') {
+    return lines.flatMap(line => wrapLineToMaxWidth(line, maxWidth));
+  }
+
+  return lines.map(line => truncateLineToMaxWidth(line, maxWidth));
+}
 
 /**
  * Limit output lines to prevent input field shrinkage (Issue #222).
@@ -50,102 +184,12 @@ export function limitOutputLines(lines: string[], maxLines?: number): string[] {
 }
 
 /**
- * Render session health analytics respecting config toggles.
- * Composes output from getSessionHealthAnalyticsData() based on showCache/showCost flags.
- */
-function renderSessionHealthAnalyticsWithConfig(
-  sessionHealth: SessionHealth,
-  enabledElements: HudElementConfig
-): string {
-  const data = getSessionHealthAnalyticsData(sessionHealth);
-  const parts: string[] = [];
-
-  // Health indicator (🟢/🟡/🔴) - controlled by showHealthIndicator
-  const showIndicator = enabledElements.showHealthIndicator ?? true;
-
-  // Cost indicator and cost amount (respects showCost)
-  if (enabledElements.showCost) {
-    if (showIndicator) {
-      parts.push(data.costIndicator, data.cost);
-    } else {
-      parts.push(data.cost);
-    }
-  } else if (showIndicator) {
-    // Show indicator even without cost
-    parts.push(data.costIndicator);
-  }
-
-  // Tokens - controlled by showTokens
-  const showTokens = enabledElements.showTokens ?? true;
-  if (showTokens) {
-    parts.push(data.tokens);
-  }
-
-  // Cache (respects showCache)
-  if (enabledElements.showCache) {
-    parts.push(`Cache: ${data.cache}`);
-  }
-
-  // Cost per hour
-  // If showCostPerHour is explicitly set, use it; otherwise default to true (backward compat)
-  const showCostHour = enabledElements.showCostPerHour ?? true;
-  if (showCostHour && enabledElements.showCost && data.costHour) {
-    parts.push(data.costHour);
-  }
-
-  return parts.join(' | ');
-}
-
-/**
  * Render the complete statusline (single or multi-line)
  */
 export async function render(context: HudRenderContext, config: HudConfig): Promise<string> {
   const elements: string[] = [];
   const detailLines: string[] = [];
   const { elements: enabledElements } = config;
-
-  // Check if analytics preset is active
-  if (config.preset === 'analytics') {
-    const analytics = await getAnalyticsDisplay();
-    const sessionInfo = await getSessionInfo();
-
-    // Render analytics-focused layout
-    const lines = [sessionInfo, renderAnalyticsLineWithConfig(analytics, enabledElements.showCost, enabledElements.showCache)];
-
-    // Add SessionHealth analytics if available
-    if (context.sessionHealth) {
-      const healthAnalytics = renderSessionHealthAnalyticsWithConfig(context.sessionHealth, enabledElements);
-      if (healthAnalytics) lines.push(healthAnalytics);
-
-      // Cache efficiency (respects showCache)
-      if (enabledElements.showCache) {
-        const cacheEfficiency = renderCacheEfficiency(context.sessionHealth);
-        if (cacheEfficiency) lines.push(cacheEfficiency);
-      }
-
-      // Budget warning
-      // If showBudgetWarning is explicitly set, use it; otherwise default to true (backward compat)
-      const showBudgetAnalytics = enabledElements.showBudgetWarning ?? true;
-      if (showBudgetAnalytics && enabledElements.showCost) {
-        const budgetWarning = renderBudgetWarning(context.sessionHealth, config.thresholds);
-        if (budgetWarning) lines.push(budgetWarning);
-      }
-    }
-
-    // Add agents if available
-    if (context.activeAgents.length > 0) {
-      const agents = renderAgentsByFormat(context.activeAgents, enabledElements.agentsFormat || 'codes');
-      if (agents) lines.push(agents);
-    }
-
-    // Add todos if available
-    if (enabledElements.todos) {
-      const todos = renderTodosWithCurrent(context.todos);
-      if (todos) lines.push(todos);
-    }
-
-    return limitOutputLines(lines, config.elements.maxOutputLines).join('\n');
-  }
 
   // Git info line (separate line above HUD)
   const gitElements: string[] = [];
@@ -174,6 +218,17 @@ export async function render(context: HudRenderContext, config: HudConfig): Prom
     if (modelElement) gitElements.push(modelElement);
   }
 
+  // API key source
+  if (enabledElements.apiKeySource && context.apiKeySource) {
+    const keySource = renderApiKeySource(context.apiKeySource);
+    if (keySource) gitElements.push(keySource);
+  }
+
+  // Profile name (from CLAUDE_CONFIG_DIR)
+  if (enabledElements.profile && context.profileName) {
+    gitElements.push(bold(`profile:${context.profileName}`));
+  }
+
   // [OMC#X.Y.Z] label with optional update notification
   if (enabledElements.omcLabel) {
     const versionTag = context.omcVersion ? `#${context.omcVersion}` : '';
@@ -184,12 +239,27 @@ export async function render(context: HudRenderContext, config: HudConfig): Prom
     }
   }
 
-  // Rate limits (5h and weekly)
-  if (enabledElements.rateLimits && context.rateLimits) {
-    const limits = enabledElements.useBars
-      ? renderRateLimitsWithBar(context.rateLimits)
-      : renderRateLimits(context.rateLimits);
-    if (limits) elements.push(limits);
+  // Rate limits (5h and weekly) - data takes priority over error indicator
+  if (enabledElements.rateLimits && context.rateLimitsResult) {
+    if (context.rateLimitsResult.rateLimits) {
+      // Data available (possibly stale from 429) → always show data
+      const stale = context.rateLimitsResult.stale;
+      const limits = enabledElements.useBars
+        ? renderRateLimitsWithBar(context.rateLimitsResult.rateLimits, undefined, stale)
+        : renderRateLimits(context.rateLimitsResult.rateLimits, stale);
+      if (limits) elements.push(limits);
+    } else {
+      // No data → show error indicator
+      const errorIndicator = renderRateLimitsError(context.rateLimitsResult);
+      if (errorIndicator) elements.push(errorIndicator);
+    }
+  }
+
+  // Custom rate limit buckets
+  if (context.customBuckets) {
+    const thresholdPercent = config.rateLimitsProvider?.resetsAtDisplayThresholdPercent;
+    const custom = renderCustomBuckets(context.customBuckets, thresholdPercent);
+    if (custom) elements.push(custom);
   }
 
   // Permission status indicator (heuristic-based)
@@ -204,6 +274,12 @@ export async function render(context: HudRenderContext, config: HudConfig): Prom
     if (thinking) elements.push(thinking);
   }
 
+  // Prompt submission time
+  if (enabledElements.promptTime) {
+    const prompt = renderPromptTime(context.promptTime);
+    if (prompt) elements.push(prompt);
+  }
+
   // Session health indicator
   if (enabledElements.sessionHealth && context.sessionHealth) {
     // Session duration display (session:19m)
@@ -212,18 +288,6 @@ export async function render(context: HudRenderContext, config: HudConfig): Prom
     if (showDuration) {
       const session = renderSession(context.sessionHealth);
       if (session) elements.push(session);
-    }
-
-    // Add analytics inline if available (respects showCache/showCost)
-    const analytics = renderSessionHealthAnalyticsWithConfig(context.sessionHealth, enabledElements);
-    if (analytics) elements.push(analytics);
-
-    // Add budget warning to detail lines
-    // If showBudgetWarning is explicitly set, use it; otherwise default to true (backward compat)
-    const showBudget = enabledElements.showBudgetWarning ?? true;
-    if (showBudget && enabledElements.showCost) {
-      const warning = renderBudgetWarning(context.sessionHealth, config.thresholds);
-      if (warning) detailLines.push(warning);
     }
   }
 
@@ -292,17 +356,47 @@ export async function render(context: HudRenderContext, config: HudConfig): Prom
     if (bg) elements.push(bg);
   }
 
-  // Compose output
-  const outputLines: string[] = [];
-
-  // Git info line (separate line above HUD header)
-  if (gitElements.length > 0) {
-    outputLines.push(gitElements.join(dim(' | ')));
+  // Call counts on the right side of the status line (Issue #710)
+  // Controlled by showCallCounts config option (default: true)
+  const showCounts = enabledElements.showCallCounts ?? true;
+  if (showCounts) {
+    const counts = renderCallCounts(
+      context.toolCallCount,
+      context.agentCallCount,
+      context.skillCallCount,
+    );
+    if (counts) elements.push(counts);
   }
 
-  // HUD header line
-  const headerLine = elements.join(dim(' | '));
-  outputLines.push(headerLine);
+  // Context limit warning banner (shown when ctx% >= threshold)
+  const ctxWarning = renderContextLimitWarning(
+    context.contextPercent,
+    config.contextLimitWarning.threshold,
+    config.contextLimitWarning.autoCompact
+  );
+  if (ctxWarning) detailLines.push(ctxWarning);
+
+  // Compose output
+  const outputLines: string[] = [];
+  const gitInfoLine = gitElements.length > 0 ? gitElements.join(dim(PLAIN_SEPARATOR)) : null;
+  const headerLine = elements.join(dim(PLAIN_SEPARATOR));
+
+  // Position git info based on config (default: above for backward compatibility)
+  const gitPosition = config.elements.gitInfoPosition ?? 'above';
+
+  if (gitPosition === 'above') {
+    // Git info line above HUD header (traditional layout)
+    if (gitInfoLine) {
+      outputLines.push(gitInfoLine);
+    }
+    outputLines.push(headerLine);
+  } else {
+    // Git info line below HUD header
+    outputLines.push(headerLine);
+    if (gitInfoLine) {
+      outputLines.push(gitInfoLine);
+    }
+  }
 
   // Todos on next line (if available)
   if (enabledElements.todos) {
@@ -310,21 +404,23 @@ export async function render(context: HudRenderContext, config: HudConfig): Prom
     if (todos) detailLines.push(todos);
   }
 
-  // Optionally add analytics line for full/dense presets
-  if (config.preset === 'full' || config.preset === 'dense') {
-    try {
-      const analytics = await getAnalyticsDisplay();
-      detailLines.push(renderAnalyticsLineWithConfig(analytics, enabledElements.showCost, enabledElements.showCache));
-
-      // Also add cache efficiency if SessionHealth available (respects showCache)
-      if (enabledElements.showCache && context.sessionHealth?.cacheHitRate !== undefined) {
-        const cacheEfficiency = renderCacheEfficiency(context.sessionHealth);
-        if (cacheEfficiency) detailLines.push(cacheEfficiency);
-      }
-    } catch {
-      // Analytics not available, skip
-    }
+  if (context.missionBoard && (config.missionBoard?.enabled ?? config.elements.missionBoard ?? false)) {
+    detailLines.unshift(...renderMissionBoard(context.missionBoard, config.missionBoard));
   }
 
-  return limitOutputLines([...outputLines, ...detailLines], config.elements.maxOutputLines).join('\n');
+  const widthAdjustedLines = applyMaxWidthByMode(
+    [...outputLines, ...detailLines],
+    config.maxWidth,
+    config.wrapMode
+  );
+
+  // Apply max output line limit after wrapping so wrapped output still respects maxOutputLines.
+  const limitedLines = limitOutputLines(widthAdjustedLines, config.elements.maxOutputLines);
+
+  // Ensure line-limit indicator and all other lines still respect maxWidth.
+  const finalLines = config.maxWidth && config.maxWidth > 0
+    ? limitedLines.map(line => truncateLineToMaxWidth(line, config.maxWidth!))
+    : limitedLines;
+
+  return finalLines.join('\n');
 }

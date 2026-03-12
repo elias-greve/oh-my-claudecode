@@ -12,6 +12,7 @@ import type {
   DiscordBotNotificationConfig,
   TelegramNotificationConfig,
   SlackNotificationConfig,
+  SlackBotNotificationConfig,
   WebhookNotificationConfig,
   NotificationPayload,
   NotificationResult,
@@ -21,7 +22,12 @@ import type {
   NotificationEvent,
 } from "./types.js";
 
-import { parseMentionAllowedMentions } from "./config.js";
+import {
+  parseMentionAllowedMentions,
+  validateSlackMention,
+  validateSlackChannel,
+  validateSlackUsername,
+} from "./config.js";
 
 /** Per-request timeout for individual platform sends */
 const SEND_TIMEOUT_MS = 10_000;
@@ -228,7 +234,16 @@ export async function sendDiscordBot(
       };
     }
 
-    return { platform: "discord-bot", success: true };
+    // NEW: Parse response to extract message ID
+    let messageId: string | undefined;
+    try {
+      const data = (await response.json()) as { id?: string };
+      messageId = data?.id;
+    } catch {
+      // Non-fatal: message was sent, we just can't track it
+    }
+
+    return { platform: "discord-bot", success: true, messageId };
   } catch (error) {
     return {
       platform: "discord-bot",
@@ -279,17 +294,30 @@ export async function sendTelegram(
           timeout: SEND_TIMEOUT_MS,
         },
         (res) => {
-          // Drain the response
-          res.resume();
-          if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            resolve({ platform: "telegram", success: true });
-          } else {
-            resolve({
-              platform: "telegram",
-              success: false,
-              error: `HTTP ${res.statusCode}`,
-            });
-          }
+          // Collect response chunks to parse message_id
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk: Buffer) => chunks.push(chunk));
+          res.on("end", () => {
+            if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
+              // Parse response to extract message_id
+              let messageId: string | undefined;
+              try {
+                const body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+                if (body?.result?.message_id !== undefined) {
+                  messageId = String(body.result.message_id);
+                }
+              } catch {
+                // Non-fatal: message was sent, we just can't track it
+              }
+              resolve({ platform: "telegram", success: true, messageId });
+            } else {
+              resolve({
+                platform: "telegram",
+                success: false,
+                error: `HTTP ${res.statusCode}`,
+              });
+            }
+          });
         },
       );
 
@@ -320,6 +348,25 @@ export async function sendTelegram(
 }
 
 /**
+ * Compose Slack message text with mention prefix.
+ * Slack mentions use formats like <@U12345678>, <!channel>, <!here>, <!everyone>,
+ * or <!subteam^S12345> for user groups.
+ *
+ * Defense-in-depth: re-validates mention at point of use (config layer validates
+ * at read time, but we validate again here to guard against untrusted config).
+ */
+function composeSlackText(
+  message: string,
+  mention: string | undefined,
+): string {
+  const validatedMention = validateSlackMention(mention);
+  if (validatedMention) {
+    return `${validatedMention}\n${message}`;
+  }
+  return message;
+}
+
+/**
  * Send notification via Slack incoming webhook.
  */
 export async function sendSlack(
@@ -335,12 +382,18 @@ export async function sendSlack(
   }
 
   try {
-    const body: Record<string, unknown> = { text: payload.message };
-    if (config.channel) {
-      body.channel = config.channel;
+    const text = composeSlackText(payload.message, config.mention);
+    const body: Record<string, unknown> = { text };
+    // Defense-in-depth: validate channel/username at point of use to guard
+    // against crafted config values containing shell metacharacters or
+    // path traversal sequences.
+    const validatedChannel = validateSlackChannel(config.channel);
+    if (validatedChannel) {
+      body.channel = validatedChannel;
     }
-    if (config.username) {
-      body.username = config.username;
+    const validatedUsername = validateSlackUsername(config.username);
+    if (validatedUsername) {
+      body.username = validatedUsername;
     }
 
     const response = await fetch(config.webhookUrl, {
@@ -362,6 +415,68 @@ export async function sendSlack(
   } catch (error) {
     return {
       platform: "slack",
+      success: false,
+      error: error instanceof Error ? error.message : "Unknown error",
+    };
+  }
+}
+
+/**
+ * Send notification via Slack Bot Web API (chat.postMessage).
+ * Returns message timestamp (ts) as messageId for reply correlation.
+ */
+export async function sendSlackBot(
+  config: SlackBotNotificationConfig,
+  payload: NotificationPayload,
+): Promise<NotificationResult> {
+  if (!config.enabled) {
+    return { platform: "slack-bot", success: false, error: "Not enabled" };
+  }
+
+  const botToken = config.botToken;
+  const channelId = config.channelId;
+
+  if (!botToken || !channelId) {
+    return {
+      platform: "slack-bot",
+      success: false,
+      error: "Missing botToken or channelId",
+    };
+  }
+
+  try {
+    const text = composeSlackText(payload.message, config.mention);
+    const response = await fetch("https://slack.com/api/chat.postMessage", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${botToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ channel: channelId, text }),
+      signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
+    });
+
+    if (!response.ok) {
+      return {
+        platform: "slack-bot",
+        success: false,
+        error: `HTTP ${response.status}`,
+      };
+    }
+
+    const data = await response.json() as { ok: boolean; ts?: string; error?: string };
+    if (!data.ok) {
+      return {
+        platform: "slack-bot",
+        success: false,
+        error: data.error || "Slack API error",
+      };
+    }
+
+    return { platform: "slack-bot", success: true, messageId: data.ts };
+  } catch (error) {
+    return {
+      platform: "slack-bot",
       success: false,
       error: error instanceof Error ? error.message : "Unknown error",
     };
@@ -409,6 +524,9 @@ export async function sendWebhook(
         reason: payload.reason,
         active_mode: payload.activeMode,
         question: payload.question,
+        ...(payload.replyChannel && { channel: payload.replyChannel }),
+        ...(payload.replyTarget && { to: payload.replyTarget }),
+        ...(payload.replyThread && { thread_id: payload.replyThread }),
       }),
       signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
     });
@@ -440,20 +558,26 @@ function getEffectivePlatformConfig<T>(
   config: NotificationConfig,
   event: NotificationEvent,
 ): T | undefined {
+  const topLevel = config[platform as keyof NotificationConfig] as T | undefined;
   const eventConfig = config.events?.[event];
   const eventPlatform = eventConfig?.[platform as keyof typeof eventConfig];
 
-  // Event-level override
+  // Event-level override merged with top-level defaults.
+  // This ensures fields like `mention` are inherited from top-level
+  // when the event-level config omits them.
   if (
     eventPlatform &&
     typeof eventPlatform === "object" &&
     "enabled" in eventPlatform
   ) {
+    if (topLevel && typeof topLevel === "object") {
+      return { ...topLevel, ...eventPlatform } as T;
+    }
     return eventPlatform as T;
   }
 
   // Top-level default
-  return config[platform as keyof NotificationConfig] as T | undefined;
+  return topLevel;
 }
 
 /**
@@ -466,8 +590,15 @@ export async function dispatchNotifications(
   config: NotificationConfig,
   event: NotificationEvent,
   payload: NotificationPayload,
+  platformMessages?: Map<NotificationPlatform, string>,
 ): Promise<DispatchResult> {
   const promises: Promise<NotificationResult>[] = [];
+
+  /** Get payload for a platform, using per-platform message if available. */
+  const payloadFor = (platform: NotificationPlatform): NotificationPayload =>
+    platformMessages?.has(platform)
+      ? { ...payload, message: platformMessages.get(platform)! }
+      : payload;
 
   // Discord
   const discordConfig = getEffectivePlatformConfig<DiscordNotificationConfig>(
@@ -476,7 +607,7 @@ export async function dispatchNotifications(
     event,
   );
   if (discordConfig?.enabled) {
-    promises.push(sendDiscord(discordConfig, payload));
+    promises.push(sendDiscord(discordConfig, payloadFor("discord")));
   }
 
   // Telegram
@@ -486,7 +617,7 @@ export async function dispatchNotifications(
     event,
   );
   if (telegramConfig?.enabled) {
-    promises.push(sendTelegram(telegramConfig, payload));
+    promises.push(sendTelegram(telegramConfig, payloadFor("telegram")));
   }
 
   // Slack
@@ -496,7 +627,7 @@ export async function dispatchNotifications(
     event,
   );
   if (slackConfig?.enabled) {
-    promises.push(sendSlack(slackConfig, payload));
+    promises.push(sendSlack(slackConfig, payloadFor("slack")));
   }
 
   // Webhook
@@ -506,7 +637,7 @@ export async function dispatchNotifications(
     event,
   );
   if (webhookConfig?.enabled) {
-    promises.push(sendWebhook(webhookConfig, payload));
+    promises.push(sendWebhook(webhookConfig, payloadFor("webhook")));
   }
 
   // Discord Bot
@@ -517,7 +648,18 @@ export async function dispatchNotifications(
       event,
     );
   if (discordBotConfig?.enabled) {
-    promises.push(sendDiscordBot(discordBotConfig, payload));
+    promises.push(sendDiscordBot(discordBotConfig, payloadFor("discord-bot")));
+  }
+
+  // Slack Bot
+  const slackBotConfig =
+    getEffectivePlatformConfig<SlackBotNotificationConfig>(
+      "slack-bot",
+      config,
+      event,
+    );
+  if (slackBotConfig?.enabled) {
+    promises.push(sendSlackBot(slackBotConfig, payloadFor("slack-bot")));
   }
 
   if (promises.length === 0) {
@@ -574,4 +716,140 @@ export async function dispatchNotifications(
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+// ============================================================================
+// CUSTOM INTEGRATION DISPATCH (Added for Notification Refactor)
+// ============================================================================
+
+import { execFile } from "child_process";
+import { promisify } from "util";
+import type {
+  CustomIntegration,
+  WebhookIntegrationConfig,
+  CliIntegrationConfig,
+} from "./types.js";
+import { interpolateTemplate } from "./template-engine.js";
+import { getCustomIntegrationsForEvent } from "./config.js";
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Send a webhook notification for a custom integration.
+ */
+export async function sendCustomWebhook(
+  integration: CustomIntegration,
+  payload: NotificationPayload
+): Promise<NotificationResult> {
+  const config = integration.config as WebhookIntegrationConfig;
+  
+  try {
+    // Interpolate template variables
+    const url = interpolateTemplate(config.url, payload);
+    const body = interpolateTemplate(config.bodyTemplate, payload);
+    
+    // Prepare headers
+    const headers: Record<string, string> = {};
+    for (const [key, value] of Object.entries(config.headers)) {
+      headers[key] = interpolateTemplate(value, payload);
+    }
+    
+    // Use native fetch (Node.js 18+)
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), config.timeout);
+    
+    const response = await fetch(url, {
+      method: config.method,
+      headers,
+      body: config.method !== 'GET' ? body : undefined,
+      signal: controller.signal,
+    });
+    
+    clearTimeout(timeout);
+    
+    if (!response.ok) {
+      return {
+        platform: "webhook",
+        success: false,
+        error: `HTTP ${response.status}: ${response.statusText}`,
+      };
+    }
+    
+    return {
+      platform: "webhook",
+      success: true,
+    };
+  } catch (error) {
+    return {
+      platform: "webhook",
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * Execute a CLI command for a custom integration.
+ * Uses execFile (not shell) for security.
+ */
+export async function sendCustomCli(
+  integration: CustomIntegration,
+  payload: NotificationPayload
+): Promise<NotificationResult> {
+  const config = integration.config as CliIntegrationConfig;
+  
+  try {
+    // Interpolate template variables into arguments
+    const args = config.args.map((arg) => interpolateTemplate(arg, payload));
+    
+    // Execute using execFile (array args, no shell injection possible)
+    await execFileAsync(config.command, args, {
+      timeout: config.timeout,
+      killSignal: "SIGTERM",
+    });
+    
+    return {
+      platform: "webhook", // Group with webhooks in results
+      success: true,
+    };
+  } catch (error) {
+    return {
+      platform: "webhook",
+      success: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * Dispatch notifications for custom integrations.
+ */
+export async function dispatchCustomIntegrations(
+  event: string,
+  payload: NotificationPayload
+): Promise<NotificationResult[]> {
+  const integrations = getCustomIntegrationsForEvent(event);
+  if (integrations.length === 0) return [];
+  
+  const results: NotificationResult[] = [];
+  
+  for (const integration of integrations) {
+    let result: NotificationResult;
+    
+    if (integration.type === "webhook") {
+      result = await sendCustomWebhook(integration, payload);
+    } else if (integration.type === "cli") {
+      result = await sendCustomCli(integration, payload);
+    } else {
+      result = {
+        platform: "webhook",
+        success: false,
+        error: `Unknown integration type: ${integration.type}`,
+      };
+    }
+    
+    results.push(result);
+  }
+  
+  return results;
 }

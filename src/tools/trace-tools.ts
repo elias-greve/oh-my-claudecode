@@ -12,12 +12,12 @@ import {
   readReplayEvents,
   getReplaySummary,
   type ReplayEvent,
-  type ReplaySummary,
 } from '../hooks/subagent-tracker/session-replay.js';
 import {
   validateWorkingDirectory,
 } from '../lib/worktree-paths.js';
 import { ToolDefinition } from './types.js';
+import { sessionSearchTool } from './session-history-tools.js';
 
 // ============================================================================
 // Helpers
@@ -460,4 +460,4 @@ export const traceSummaryTool: ToolDefinition<{
 /**
  * All trace tools for registration
  */
-export const traceTools = [traceTimelineTool, traceSummaryTool];
+export const traceTools = [traceTimelineTool, traceSummaryTool, sessionSearchTool];

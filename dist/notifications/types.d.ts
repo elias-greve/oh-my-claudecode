@@ -5,10 +5,12 @@
  * Supports Discord, Telegram, Slack, and generic webhooks across
  * session lifecycle events (start, stop, end, ask-user-question).
  */
+/** Verbosity levels for notification filtering (ordered most to least verbose) */
+export type VerbosityLevel = "verbose" | "agent" | "session" | "minimal";
 /** Events that can trigger notifications */
-export type NotificationEvent = "session-start" | "session-stop" | "session-end" | "session-idle" | "ask-user-question";
+export type NotificationEvent = "session-start" | "session-stop" | "session-end" | "session-idle" | "ask-user-question" | "agent-call";
 /** Supported notification platforms */
-export type NotificationPlatform = "discord" | "discord-bot" | "telegram" | "slack" | "webhook";
+export type NotificationPlatform = "discord" | "discord-bot" | "telegram" | "slack" | "slack-bot" | "webhook";
 /** Discord webhook configuration */
 export interface DiscordNotificationConfig {
     enabled: boolean;
@@ -48,6 +50,22 @@ export interface SlackNotificationConfig {
     channel?: string;
     /** Optional username override */
     username?: string;
+    /** Optional mention to prepend to messages (e.g. "<@U12345678>" for user, "<!subteam^S12345>" for group, "<!channel>" / "<!here>" / "<!everyone>") */
+    mention?: string;
+    /** Slack signing secret for verifying incoming WebSocket/Events API messages */
+    signingSecret?: string;
+}
+/** Slack Bot API configuration (Socket Mode for inbound, Web API for outbound) */
+export interface SlackBotNotificationConfig {
+    enabled: boolean;
+    /** Slack app-level token for Socket Mode (xapp-...) */
+    appToken?: string;
+    /** Slack bot token for Web API (xoxb-...) */
+    botToken?: string;
+    /** Channel ID for sending messages and listening */
+    channelId?: string;
+    /** Optional mention to prepend to messages */
+    mention?: string;
 }
 /** Generic webhook configuration */
 export interface WebhookNotificationConfig {
@@ -60,29 +78,33 @@ export interface WebhookNotificationConfig {
     method?: "POST" | "PUT";
 }
 /** Platform config union */
-export type PlatformConfig = DiscordNotificationConfig | DiscordBotNotificationConfig | TelegramNotificationConfig | SlackNotificationConfig | WebhookNotificationConfig;
+export type PlatformConfig = DiscordNotificationConfig | DiscordBotNotificationConfig | TelegramNotificationConfig | SlackNotificationConfig | SlackBotNotificationConfig | WebhookNotificationConfig;
 /** Per-event notification configuration */
 export interface EventNotificationConfig {
     /** Whether this event triggers notifications */
     enabled: boolean;
-    /** Custom message template (optional, uses default if not set) */
-    messageTemplate?: string;
     /** Platform overrides for this event (inherits from top-level if not set) */
     discord?: DiscordNotificationConfig;
     "discord-bot"?: DiscordBotNotificationConfig;
     telegram?: TelegramNotificationConfig;
     slack?: SlackNotificationConfig;
+    "slack-bot"?: SlackBotNotificationConfig;
     webhook?: WebhookNotificationConfig;
 }
 /** Top-level notification configuration (stored in .omc-config.json) */
 export interface NotificationConfig {
     /** Global enable/disable for all notifications */
     enabled: boolean;
+    /** Verbosity level controlling which events fire and tmux tail inclusion */
+    verbosity?: VerbosityLevel;
+    /** Number of tmux pane lines to capture for notification tail content */
+    tmuxTailLines?: number;
     /** Default platform configs (used when event-specific config is not set) */
     discord?: DiscordNotificationConfig;
     "discord-bot"?: DiscordBotNotificationConfig;
     telegram?: TelegramNotificationConfig;
     slack?: SlackNotificationConfig;
+    "slack-bot"?: SlackBotNotificationConfig;
     webhook?: WebhookNotificationConfig;
     /** Per-event configuration */
     events?: {
@@ -91,6 +113,7 @@ export interface NotificationConfig {
         "session-end"?: EventNotificationConfig;
         "session-idle"?: EventNotificationConfig;
         "ask-user-question"?: EventNotificationConfig;
+        "agent-call"?: EventNotificationConfig;
     };
 }
 /** Payload sent with each notification */
@@ -131,12 +154,31 @@ export interface NotificationPayload {
     question?: string;
     /** Incomplete task count */
     incompleteTasks?: number;
+    /** tmux pane ID for reply injection target */
+    tmuxPaneId?: string;
+    /** Agent name for agent-call events (e.g., "executor", "architect") */
+    agentName?: string;
+    /** Agent type for agent-call events (e.g., "oh-my-claudecode:executor") */
+    agentType?: string;
+    /** Captured tmux pane content (last N lines) */
+    tmuxTail?: string;
+    /** Max meaningful lines to display from tmux tail */
+    maxTailLines?: number;
+    /** Reply channel name (from OPENCLAW_REPLY_CHANNEL env var) */
+    replyChannel?: string;
+    /** Reply target (from OPENCLAW_REPLY_TARGET env var) */
+    replyTarget?: string;
+    /** Reply thread ID (from OPENCLAW_REPLY_THREAD env var) */
+    replyThread?: string;
 }
+/** Named notification profiles (keyed by profile name) */
+export type NotificationProfilesConfig = Record<string, NotificationConfig>;
 /** Result of a notification send attempt */
 export interface NotificationResult {
     platform: NotificationPlatform;
     success: boolean;
     error?: string;
+    messageId?: string;
 }
 /** Result of dispatching notifications for an event */
 export interface DispatchResult {
@@ -144,5 +186,70 @@ export interface DispatchResult {
     results: NotificationResult[];
     /** Whether at least one notification was sent successfully */
     anySuccess: boolean;
+}
+/** Reply injection configuration */
+export interface ReplyConfig {
+    enabled: boolean;
+    /** Polling interval in milliseconds (default: 3000) */
+    pollIntervalMs: number;
+    /** Maximum message length (default: 500) */
+    maxMessageLength: number;
+    /** Rate limit: max messages per minute (default: 10) */
+    rateLimitPerMinute: number;
+    /** Include visual prefix like [reply:discord] (default: true) */
+    includePrefix: boolean;
+    /** Authorized Discord user IDs (REQUIRED for Discord, empty = Discord disabled) */
+    authorizedDiscordUserIds: string[];
+}
+/** Type of custom integration */
+export type CustomIntegrationType = 'webhook' | 'cli';
+/** Configuration for webhook-based custom integrations */
+export interface WebhookIntegrationConfig {
+    /** Webhook URL (must be HTTPS for production) */
+    url: string;
+    /** HTTP method */
+    method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+    /** HTTP headers to include */
+    headers: Record<string, string>;
+    /** Body template with {{variable}} interpolation */
+    bodyTemplate: string;
+    /** Timeout in milliseconds (1000-60000) */
+    timeout: number;
+}
+/** Configuration for CLI-based custom integrations */
+export interface CliIntegrationConfig {
+    /** Command to execute (single executable, no spaces) */
+    command: string;
+    /** Arguments array (supports {{variable}} interpolation) */
+    args: string[];
+    /** Timeout in milliseconds (1000-60000) */
+    timeout: number;
+}
+/** Custom integration definition */
+export interface CustomIntegration {
+    /** Unique identifier for this integration (alphanumeric with hyphens/underscores) */
+    id: string;
+    /** Integration type: webhook or cli */
+    type: CustomIntegrationType;
+    /** Preset name if created from a preset (openclaw, n8n, etc.) */
+    preset?: string;
+    /** Whether this integration is enabled */
+    enabled: boolean;
+    /** Type-specific configuration */
+    config: WebhookIntegrationConfig | CliIntegrationConfig;
+    /** Events that trigger this integration */
+    events: NotificationEvent[];
+}
+/** Custom integrations configuration section */
+export interface CustomIntegrationsConfig {
+    /** Global enable/disable for all custom integrations */
+    enabled: boolean;
+    /** List of custom integrations */
+    integrations: CustomIntegration[];
+}
+/** Extended notification config including custom integrations */
+export interface ExtendedNotificationConfig extends NotificationConfig {
+    /** Custom webhook/CLI integrations (new in notification refactor) */
+    customIntegrations?: CustomIntegrationsConfig;
 }
 //# sourceMappingURL=types.d.ts.map

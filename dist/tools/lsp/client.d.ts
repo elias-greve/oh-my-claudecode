@@ -5,6 +5,8 @@
  * Handles server lifecycle, message buffering, and request/response matching.
  */
 import type { LspServerConfig } from './servers.js';
+/** Default timeout (ms) for LSP requests. Override with OMC_LSP_TIMEOUT_MS env var. */
+export declare const DEFAULT_LSP_REQUEST_TIMEOUT_MS: number;
 export interface Position {
     line: number;
     character: number;
@@ -89,6 +91,7 @@ export declare class LspClient {
     private buffer;
     private openDocuments;
     private diagnostics;
+    private diagnosticWaiters;
     private workspaceRoot;
     private serverConfig;
     private initialized;
@@ -98,9 +101,19 @@ export declare class LspClient {
      */
     connect(): Promise<void>;
     /**
+     * Synchronously kill the LSP server process.
+     * Used in process exit handlers where async operations are not possible.
+     */
+    forceKill(): void;
+    /**
      * Disconnect from the LSP server
      */
     disconnect(): Promise<void>;
+    /**
+     * Reject all pending requests with the given error.
+     * Called on process exit to avoid dangling unresolved promises.
+     */
+    private rejectPendingRequests;
     /**
      * Handle incoming data from the server
      */
@@ -166,6 +179,13 @@ export declare class LspClient {
      */
     getDiagnostics(filePath: string): Diagnostic[];
     /**
+     * Wait for the server to publish diagnostics for a file.
+     * Resolves as soon as textDocument/publishDiagnostics fires for the URI,
+     * or after `timeoutMs` milliseconds (whichever comes first).
+     * This replaces fixed-delay sleeps with a notification-driven approach.
+     */
+    waitForDiagnostics(filePath: string, timeoutMs?: number): Promise<void>;
+    /**
      * Prepare rename (check if rename is valid)
      */
     prepareRename(filePath: string, line: number, character: number): Promise<Range | null>;
@@ -192,6 +212,12 @@ declare class LspClientManager {
     private inFlightCount;
     private idleTimer;
     constructor();
+    /**
+     * Register process exit/signal handlers to kill all spawned LSP server processes.
+     * Prevents orphaned language server processes (e.g. kotlin-language-server)
+     * when the MCP bridge process exits or a claude session ends.
+     */
+    private registerCleanupHandlers;
     /**
      * Get or create a client for a file
      */

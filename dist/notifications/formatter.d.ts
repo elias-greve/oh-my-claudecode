@@ -25,6 +25,19 @@ export declare function formatSessionEnd(payload: NotificationPayload): string;
  */
 export declare function formatSessionIdle(payload: NotificationPayload): string;
 /**
+ * Parse raw tmux output into clean, human-readable lines.
+ * - Strips ANSI escape codes
+ * - Drops lines starting with OMC chrome characters (●, ⎿, ✻, ·, ◼)
+ * - Drops "ctrl+o to expand" hint lines
+ * - Returns at most `maxLines` non-empty lines (default 10)
+ */
+export declare function parseTmuxTail(raw: string, maxLines?: number): string;
+/**
+ * Format agent-call notification message.
+ * Sent when a new agent (Task) is spawned.
+ */
+export declare function formatAgentCall(payload: NotificationPayload): string;
+/**
  * Format ask-user-question notification message.
  * Notifies the user that Claude is waiting for input.
  */

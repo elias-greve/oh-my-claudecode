@@ -116,8 +116,21 @@ describe('isOmcStatusLine', () => {
     expect(isOmcStatusLine(undefined)).toBe(false);
   });
 
-  it('should return false for non-object', () => {
-    expect(isOmcStatusLine('string')).toBe(false);
+  // Legacy string format tests (pre-v4.5 compatibility)
+  it('should return true for legacy string containing omc-hud', () => {
+    expect(isOmcStatusLine('~/.claude/hud/omc-hud.mjs')).toBe(true);
+  });
+
+  it('should return true for legacy string with absolute path to omc-hud', () => {
+    expect(isOmcStatusLine('/home/user/.claude/hud/omc-hud.mjs')).toBe(true);
+  });
+
+  it('should return false for non-OMC string', () => {
+    expect(isOmcStatusLine('my-custom-statusline')).toBe(false);
+  });
+
+  it('should return false for empty string', () => {
+    expect(isOmcStatusLine('')).toBe(false);
   });
 
   it('should return false for object without command', () => {
@@ -126,5 +139,19 @@ describe('isOmcStatusLine', () => {
 
   it('should return false for object with non-string command', () => {
     expect(isOmcStatusLine({ type: 'command', command: 42 })).toBe(false);
+  });
+
+  it('should recognize portable $HOME statusLine as OMC', () => {
+    expect(isOmcStatusLine({
+      type: 'command',
+      command: 'node $HOME/.claude/hud/omc-hud.mjs'
+    })).toBe(true);
+  });
+
+  it('should recognize find-node.sh statusLine as OMC', () => {
+    expect(isOmcStatusLine({
+      type: 'command',
+      command: 'sh $HOME/.claude/hud/find-node.sh $HOME/.claude/hud/omc-hud.mjs'
+    })).toBe(true);
   });
 });

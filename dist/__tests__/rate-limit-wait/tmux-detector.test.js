@@ -83,6 +83,23 @@ describe('tmux-detector', () => {
             const result = analyzePaneContent(content);
             expect(result.confidence).toBeGreaterThan(0.6);
         });
+        it('should detect Claude limit screen phrasing: hit your limit + numeric menu', () => {
+            const content = `
+        Claude Code
+        You've hit your limit · resets Feb 17 at 2pm (Asia/Seoul)
+        What do you want to do?
+
+        ❯ 1. Stop and wait for limit to reset
+          2. Request more
+
+        Enter to confirm · Esc to cancel
+      `;
+            const result = analyzePaneContent(content);
+            expect(result.hasClaudeCode).toBe(true);
+            expect(result.hasRateLimitMessage).toBe(true);
+            expect(result.isBlocked).toBe(true);
+            expect(result.confidence).toBeGreaterThanOrEqual(0.6);
+        });
     });
     describe('isTmuxAvailable', () => {
         it('should return true when tmux is installed', () => {
@@ -172,7 +189,7 @@ describe('tmux-detector', () => {
             vi.mocked(execSync).mockReturnValue('Line 1\nLine 2\nLine 3\n');
             const content = capturePaneContent('%0', 3);
             expect(content).toBe('Line 1\nLine 2\nLine 3\n');
-            expect(execSync).toHaveBeenCalledWith("tmux capture-pane -t '%0' -p -S -3", expect.any(Object));
+            expect(execSync).toHaveBeenCalledWith('tmux capture-pane -t "%0" -p -S -3', expect.any(Object));
         });
         it('should return empty string when tmux not available', () => {
             vi.mocked(spawnSync).mockReturnValue({

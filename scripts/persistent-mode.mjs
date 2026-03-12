@@ -5,7 +5,7 @@
  * Minimal continuation enforcer for all OMC modes.
  * Stripped down for reliability — no optional imports, no PRD, no notepad pruning.
  *
- * Supported modes: ralph, autopilot, ultrapilot, swarm, ultrawork, ecomode, ultraqa, pipeline
+ * Supported modes: ralph, autopilot, ultrapilot, swarm, ultrawork, ultraqa, pipeline, team
  */
 
 import {
@@ -132,6 +132,29 @@ Do NOT skip this step. Do NOT move on without fixing the error.
  * from causing the stop hook to malfunction in new sessions.
  */
 const STALE_STATE_THRESHOLD_MS = 2 * 60 * 60 * 1000; // 2 hours
+const TEAM_TERMINAL_PHASES = new Set([
+  "completed",
+  "complete",
+  "failed",
+  "cancelled",
+  "canceled",
+  "aborted",
+  "terminated",
+  "done",
+]);
+const TEAM_ACTIVE_PHASES = new Set([
+  "team-plan",
+  "team-prd",
+  "team-exec",
+  "team-verify",
+  "team-fix",
+  "planning",
+  "executing",
+  "verify",
+  "verification",
+  "fix",
+  "fixing",
+]);
 
 /**
  * Check if a state is stale based on its timestamps.
@@ -151,6 +174,23 @@ function isStaleState(state) {
 
   const age = Date.now() - mostRecent;
   return age > STALE_STATE_THRESHOLD_MS;
+}
+
+function normalizeTeamPhase(state) {
+  if (!state || typeof state !== "object") return null;
+
+  const rawPhase = state.current_phase ?? state.phase ?? state.stage;
+  if (typeof rawPhase !== "string") return null;
+
+  const phase = rawPhase.trim().toLowerCase();
+  if (!phase || TEAM_TERMINAL_PHASES.has(phase)) return null;
+  return TEAM_ACTIVE_PHASES.has(phase) ? phase : null;
+}
+
+function getSafeReinforcementCount(value) {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : 0;
 }
 
 /**
@@ -325,7 +365,15 @@ function countIncompleteTodos(sessionId, projectDir) {
  * See: https://github.com/Yeachan-Heo/oh-my-claudecode/issues/213
  */
 function isContextLimitStop(data) {
-  const reason = (data.stop_reason || data.stopReason || "").toLowerCase();
+  const reasons = [
+    data.stop_reason,
+    data.stopReason,
+    data.end_turn_reason,
+    data.endTurnReason,
+    data.reason,
+  ]
+    .filter((value) => typeof value === "string" && value.trim().length > 0)
+    .map((value) => value.toLowerCase().replace(/[\s-]+/g, "_"));
 
   const contextPatterns = [
     "context_limit",
@@ -339,20 +387,26 @@ function isContextLimitStop(data) {
     "input_too_long",
   ];
 
-  if (contextPatterns.some((p) => reason.includes(p))) {
-    return true;
-  }
+  return reasons.some((reason) => contextPatterns.some((p) => reason.includes(p)));
+}
 
-  const endTurnReason = (
-    data.end_turn_reason ||
-    data.endTurnReason ||
-    ""
-  ).toLowerCase();
-  if (endTurnReason && contextPatterns.some((p) => endTurnReason.includes(p))) {
-    return true;
-  }
+const CRITICAL_CONTEXT_STOP_PERCENT = 95;
 
-  return false;
+function estimateContextPercent(transcriptPath) {
+  if (!transcriptPath || !existsSync(transcriptPath)) return 0;
+  try {
+    const content = readFileSync(transcriptPath, "utf-8");
+    const windowMatch = content.match(/"context_window"\s{0,5}:\s{0,5}(\d+)/g);
+    const inputMatch = content.match(/"input_tokens"\s{0,5}:\s{0,5}(\d+)/g);
+    if (!windowMatch || !inputMatch) return 0;
+
+    const lastWindow = parseInt(windowMatch[windowMatch.length - 1].match(/(\d+)/)[1], 10);
+    const lastInput = parseInt(inputMatch[inputMatch.length - 1].match(/(\d+)/)[1], 10);
+    if (!Number.isFinite(lastWindow) || lastWindow <= 0 || !Number.isFinite(lastInput)) return 0;
+    return Math.round((lastInput / lastWindow) * 100);
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -375,6 +429,38 @@ function isUserAbort(data) {
   return (
     exactPatterns.some((p) => reason === p) ||
     substringPatterns.some((p) => reason.includes(p))
+  );
+}
+
+const AUTHENTICATION_ERROR_PATTERNS = [
+  "authentication_error",
+  "authentication_failed",
+  "auth_error",
+  "unauthorized",
+  "unauthorised",
+  "401",
+  "403",
+  "forbidden",
+  "invalid_token",
+  "token_invalid",
+  "token_expired",
+  "expired_token",
+  "oauth_expired",
+  "oauth_token_expired",
+  "invalid_grant",
+  "insufficient_scope",
+];
+
+function isAuthenticationError(data) {
+  const reason = (data.stop_reason || data.stopReason || "").toLowerCase();
+  const endTurnReason = (
+    data.end_turn_reason ||
+    data.endTurnReason ||
+    ""
+  ).toLowerCase();
+
+  return AUTHENTICATION_ERROR_PATTERNS.some(
+    (pattern) => reason.includes(pattern) || endTurnReason.includes(pattern),
   );
 }
 
@@ -401,8 +487,20 @@ async function main() {
       return;
     }
 
+    const criticalTranscriptPath = data.transcript_path || data.transcriptPath || "";
+    if (estimateContextPercent(criticalTranscriptPath) >= CRITICAL_CONTEXT_STOP_PERCENT) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
     // Respect user abort (Ctrl+C, cancel)
     if (isUserAbort(data)) {
+      console.log(JSON.stringify({ continue: true, suppressOutput: true }));
+      return;
+    }
+
+    // Never block auth failures (401/403/expired OAuth): allow re-auth flow.
+    if (isAuthenticationError(data)) {
       console.log(JSON.stringify({ continue: true, suppressOutput: true }));
       return;
     }
@@ -432,12 +530,6 @@ async function main() {
       "ultrawork-state.json",
       sessionId,
     );
-    const ecomode = readStateFileWithSession(
-      stateDir,
-      globalStateDir,
-      "ecomode-state.json",
-      sessionId,
-    );
     const ultraqa = readStateFileWithSession(
       stateDir,
       globalStateDir,
@@ -448,6 +540,18 @@ async function main() {
       stateDir,
       globalStateDir,
       "pipeline-state.json",
+      sessionId,
+    );
+    const team = readStateFileWithSession(
+      stateDir,
+      globalStateDir,
+      "team-state.json",
+      sessionId,
+    );
+    const omcTeams = readStateFileWithSession(
+      stateDir,
+      globalStateDir,
+      "omc-teams-state.json",
       sessionId,
     );
 
@@ -489,12 +593,27 @@ async function main() {
 
           console.log(
             JSON.stringify({
+              continue: false,
               decision: "block",
               reason,
             }),
           );
           return;
         }
+
+        // Do not silently stop Ralph once it hits max iterations; extend and keep going.
+        ralph.state.max_iterations = maxIter + 10;
+        ralph.state.last_checked_at = new Date().toISOString();
+        writeJsonFile(ralph.path, ralph.state);
+
+        console.log(
+          JSON.stringify({
+            continue: false,
+            decision: "block",
+            reason: `[RALPH LOOP - EXTENDED] Max iterations reached; extending to ${ralph.state.max_iterations} and continuing. When FULLY complete (after Architect verification), run /oh-my-claudecode:cancel (or --force).`,
+          }),
+        );
+        return;
       }
     }
 
@@ -526,6 +645,7 @@ async function main() {
 
             console.log(
               JSON.stringify({
+                continue: false,
                 decision: "block",
                 reason,
               }),
@@ -566,6 +686,7 @@ async function main() {
 
           console.log(
             JSON.stringify({
+              continue: false,
               decision: "block",
               reason,
             }),
@@ -601,6 +722,7 @@ async function main() {
 
           console.log(
             JSON.stringify({
+              continue: false,
               decision: "block",
               reason,
             }),
@@ -638,6 +760,7 @@ async function main() {
 
           console.log(
             JSON.stringify({
+              continue: false,
               decision: "block",
               reason,
             }),
@@ -647,7 +770,79 @@ async function main() {
       }
     }
 
-    // Priority 6: UltraQA (QA cycling)
+    // Priority 6: Team (native Claude Code teams / staged pipeline)
+    if (
+      team.state?.active &&
+      !isStaleState(team.state) &&
+      isStateForCurrentProject(team.state, directory, team.isGlobal)
+    ) {
+      const sessionMatches = hasValidSessionId
+        ? team.state.session_id === sessionId
+        : !team.state.session_id || team.state.session_id === sessionId;
+      if (sessionMatches) {
+        const phase = normalizeTeamPhase(team.state);
+        if (phase) {
+          const newCount = getSafeReinforcementCount(team.state.reinforcement_count) + 1;
+          if (newCount <= 20) {
+            const toolError = readLastToolError(stateDir);
+            const errorGuidance = getToolErrorRetryGuidance(toolError);
+
+            team.state.reinforcement_count = newCount;
+            team.state.last_checked_at = new Date().toISOString();
+            writeJsonFile(team.path, team.state);
+
+            let reason = `[TEAM - Phase: ${phase}] Team mode active. Continue working. When all team tasks complete, run /oh-my-claudecode:cancel to cleanly exit. If cancel fails, retry with /oh-my-claudecode:cancel --force.`;
+            if (errorGuidance) {
+              reason = errorGuidance + reason;
+            }
+
+            console.log(
+              JSON.stringify({
+                continue: false,
+                decision: "block",
+                reason,
+              }),
+            );
+            return;
+          }
+        }
+      }
+    }
+
+    // Priority 6.5: OMC Teams (tmux CLI workers — independent of native team state)
+    if (
+      omcTeams.state?.active &&
+      !isStaleState(omcTeams.state) &&
+      isStateForCurrentProject(omcTeams.state, directory, omcTeams.isGlobal)
+    ) {
+      const sessionMatches = hasValidSessionId
+        ? omcTeams.state.session_id === sessionId
+        : !omcTeams.state.session_id || omcTeams.state.session_id === sessionId;
+      if (sessionMatches) {
+        const phase = normalizeTeamPhase(omcTeams.state);
+        if (phase) {
+          const newCount = getSafeReinforcementCount(omcTeams.state.reinforcement_count) + 1;
+          if (newCount <= 20) {
+            const toolError = readLastToolError(stateDir);
+            const errorGuidance = getToolErrorRetryGuidance(toolError);
+
+            omcTeams.state.reinforcement_count = newCount;
+            omcTeams.state.last_checked_at = new Date().toISOString();
+            writeJsonFile(omcTeams.path, omcTeams.state);
+
+            let reason = `[OMC TEAMS - Phase: ${phase}] OMC Teams workers active. Continue working. When all workers complete, run /oh-my-claudecode:cancel to cleanly exit. If cancel fails, retry with /oh-my-claudecode:cancel --force.`;
+            if (errorGuidance) {
+              reason = errorGuidance + reason;
+            }
+
+            console.log(JSON.stringify({ continue: false, decision: "block", reason }));
+            return;
+          }
+        }
+      }
+    }
+
+    // Priority 7: UltraQA (QA cycling)
     if (
       ultraqa.state?.active &&
       !isStaleState(ultraqa.state) &&
@@ -673,6 +868,7 @@ async function main() {
 
         console.log(
           JSON.stringify({
+            continue: false,
             decision: "block",
             reason,
           }),
@@ -681,7 +877,7 @@ async function main() {
       }
     }
 
-    // Priority 7: Ultrawork - ALWAYS continue while active (not just when tasks exist)
+    // Priority 8: Ultrawork - ALWAYS continue while active (not just when tasks exist)
     // This prevents false stops from bash errors, transient failures, etc.
     // Session isolation: only block if state belongs to this session (issue #311)
     // If state has session_id, it must match. If no session_id (legacy), allow.
@@ -698,7 +894,13 @@ async function main() {
       const maxReinforcements = ultrawork.state.max_reinforcements || 50;
 
       if (newCount > maxReinforcements) {
-        // Max reinforcements reached - allow stop
+        try {
+          unlinkSync(ultrawork.path);
+        } catch {
+          ultrawork.state.active = false;
+          ultrawork.state.last_checked_at = new Date().toISOString();
+          writeJsonFile(ultrawork.path, ultrawork.state);
+        }
         console.log(JSON.stringify({ continue: true, suppressOutput: true }));
         return;
       }
@@ -715,13 +917,11 @@ async function main() {
       if (totalIncomplete > 0) {
         const itemType = taskCount > 0 ? "Tasks" : "todos";
         reason += ` ${totalIncomplete} incomplete ${itemType} remain. Continue working.`;
-      } else if (newCount >= 3) {
-        // Only suggest cancel after minimum iterations (guard against no-tasks-created scenario)
-        reason += ` If all work is complete, run /oh-my-claudecode:cancel to cleanly exit ultrawork mode and clean up state files. If cancel fails, retry with /oh-my-claudecode:cancel --force. Otherwise, continue working.`;
       } else {
-        // Early iterations with no tasks yet - just tell LLM to continue
         reason += ` Continue working - create Tasks to track your progress.`;
       }
+
+      reason += ` If all requested work is fully complete and verified right now, your next action must be /oh-my-claudecode:cancel to cleanly exit ultrawork mode and clean up state files. If that command fails, retry with /oh-my-claudecode:cancel --force. Do not just say the work is done.`;
 
       if (ultrawork.state.original_prompt) {
         reason += `\nTask: ${ultrawork.state.original_prompt}`;
@@ -731,53 +931,7 @@ async function main() {
         reason = errorGuidance + reason;
       }
 
-      console.log(JSON.stringify({ decision: "block", reason }));
-      return;
-    }
-
-    // Priority 8: Ecomode - ALWAYS continue while active
-    if (
-      ecomode.state?.active &&
-      !isStaleState(ecomode.state) &&
-      (hasValidSessionId
-        ? ecomode.state.session_id === sessionId
-        : !ecomode.state.session_id || ecomode.state.session_id === sessionId) &&
-      isStateForCurrentProject(ecomode.state, directory, ecomode.isGlobal)
-    ) {
-      const newCount = (ecomode.state.reinforcement_count || 0) + 1;
-      const maxReinforcements = ecomode.state.max_reinforcements || 50;
-
-      if (newCount > maxReinforcements) {
-        // Max reinforcements reached - allow stop
-        console.log(JSON.stringify({ continue: true, suppressOutput: true }));
-        return;
-      }
-
-      const toolError = readLastToolError(stateDir);
-      const errorGuidance = getToolErrorRetryGuidance(toolError);
-
-      ecomode.state.reinforcement_count = newCount;
-      ecomode.state.last_checked_at = new Date().toISOString();
-      writeJsonFile(ecomode.path, ecomode.state);
-
-      let reason = `[ECOMODE #${newCount}/${maxReinforcements}] Mode active.`;
-
-      if (totalIncomplete > 0) {
-        const itemType = taskCount > 0 ? "Tasks" : "todos";
-        reason += ` ${totalIncomplete} incomplete ${itemType} remain. Continue working.`;
-      } else if (newCount >= 3) {
-        // Only suggest cancel after minimum iterations (guard against no-tasks-created scenario)
-        reason += ` If all work is complete, run /oh-my-claudecode:cancel to cleanly exit ecomode and clean up state files. If cancel fails, retry with /oh-my-claudecode:cancel --force. Otherwise, continue working.`;
-      } else {
-        // Early iterations with no tasks yet - just tell LLM to continue
-        reason += ` Continue working - create Tasks to track your progress.`;
-      }
-
-      if (errorGuidance) {
-        reason = errorGuidance + reason;
-      }
-
-      console.log(JSON.stringify({ decision: "block", reason }));
+      console.log(JSON.stringify({ continue: false, decision: "block", reason }));
       return;
     }
 

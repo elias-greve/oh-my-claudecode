@@ -2,110 +2,138 @@
  * Configuration Loader
  *
  * Handles loading and merging configuration from multiple sources:
- * - User config: ~/.config/claude-sisyphus/config.jsonc
- * - Project config: .claude/sisyphus.jsonc
+ * - User config: ~/.config/claude-omc/config.jsonc
+ * - Project config: .claude/omc.jsonc
  * - Environment variables
  */
 import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
-import * as jsonc from 'jsonc-parser';
 import { getConfigDir } from '../utils/paths.js';
+import { parseJsonc } from '../utils/jsonc.js';
+import { getDefaultTierModels, BUILTIN_EXTERNAL_MODEL_DEFAULTS, isNonClaudeProvider, } from './models.js';
 /**
- * Default configuration
+ * Default configuration.
+ *
+ * Model IDs are resolved from environment variables (OMC_MODEL_HIGH,
+ * OMC_MODEL_MEDIUM, OMC_MODEL_LOW) with built-in fallbacks.
+ * User/project config files can further override via deepMerge.
+ *
+ * Note: env vars for external model defaults (OMC_CODEX_DEFAULT_MODEL,
+ * OMC_GEMINI_DEFAULT_MODEL) are read lazily in loadEnvConfig() to avoid
+ * capturing stale values at module load time.
  */
-export const DEFAULT_CONFIG = {
-    agents: {
-        omc: { model: 'claude-opus-4-6-20260205' },
-        architect: { model: 'claude-opus-4-6-20260205', enabled: true },
-        researcher: { model: 'claude-sonnet-4-5-20250929' },
-        explore: { model: 'claude-haiku-4-5-20251001' },
-        frontendEngineer: { model: 'claude-sonnet-4-5-20250929', enabled: true },
-        documentWriter: { model: 'claude-haiku-4-5-20251001', enabled: true },
-        multimodalLooker: { model: 'claude-sonnet-4-5-20250929', enabled: true },
-        // New agents from oh-my-opencode
-        critic: { model: 'claude-opus-4-6-20260205', enabled: true },
-        analyst: { model: 'claude-opus-4-6-20260205', enabled: true },
-        orchestratorSisyphus: { model: 'claude-sonnet-4-5-20250929', enabled: true },
-        sisyphusJunior: { model: 'claude-sonnet-4-5-20250929', enabled: true },
-        planner: { model: 'claude-opus-4-6-20260205', enabled: true }
-    },
-    features: {
-        parallelExecution: true,
-        lspTools: true, // Real LSP integration with language servers
-        astTools: true, // Real AST tools using ast-grep
-        continuationEnforcement: true,
-        autoContextInjection: true
-    },
-    mcpServers: {
-        exa: { enabled: true },
-        context7: { enabled: true }
-    },
-    permissions: {
-        allowBash: true,
-        allowEdit: true,
-        allowWrite: true,
-        maxBackgroundTasks: 5
-    },
-    magicKeywords: {
-        ultrawork: ['ultrawork', 'ulw', 'uw'],
-        search: ['search', 'find', 'locate'],
-        analyze: ['analyze', 'investigate', 'examine'],
-        ultrathink: ['ultrathink', 'think', 'reason', 'ponder']
-    },
-    // Intelligent model routing configuration
-    routing: {
-        enabled: true,
-        defaultTier: 'MEDIUM',
-        escalationEnabled: true,
-        maxEscalations: 2,
-        tierModels: {
-            LOW: 'claude-haiku-4-5-20251001',
-            MEDIUM: 'claude-sonnet-4-5-20250929',
-            HIGH: 'claude-opus-4-6-20260205'
+export function buildDefaultConfig() {
+    const defaultTierModels = getDefaultTierModels();
+    return {
+        agents: {
+            omc: { model: defaultTierModels.HIGH },
+            explore: { model: defaultTierModels.LOW },
+            analyst: { model: defaultTierModels.HIGH },
+            planner: { model: defaultTierModels.HIGH },
+            architect: { model: defaultTierModels.HIGH },
+            debugger: { model: defaultTierModels.MEDIUM },
+            executor: { model: defaultTierModels.MEDIUM },
+            verifier: { model: defaultTierModels.MEDIUM },
+            securityReviewer: { model: defaultTierModels.MEDIUM },
+            codeReviewer: { model: defaultTierModels.HIGH },
+            testEngineer: { model: defaultTierModels.MEDIUM },
+            designer: { model: defaultTierModels.MEDIUM },
+            writer: { model: defaultTierModels.LOW },
+            qaTester: { model: defaultTierModels.MEDIUM },
+            scientist: { model: defaultTierModels.MEDIUM },
+            gitMaster: { model: defaultTierModels.MEDIUM },
+            codeSimplifier: { model: defaultTierModels.HIGH },
+            critic: { model: defaultTierModels.HIGH },
+            documentSpecialist: { model: defaultTierModels.MEDIUM },
         },
-        agentOverrides: {
-            architect: { tier: 'HIGH', reason: 'Advisory agent requires deep reasoning' },
-            planner: { tier: 'HIGH', reason: 'Strategic planning requires deep reasoning' },
-            critic: { tier: 'HIGH', reason: 'Critical review requires deep reasoning' },
-            analyst: { tier: 'HIGH', reason: 'Pre-planning analysis requires deep reasoning' },
-            explore: { tier: 'LOW', reason: 'Exploration is search-focused' },
-            'writer': { tier: 'LOW', reason: 'Documentation is straightforward' }
+        features: {
+            parallelExecution: true,
+            lspTools: true, // Real LSP integration with language servers
+            astTools: true, // Real AST tools using ast-grep
+            continuationEnforcement: true,
+            autoContextInjection: true
         },
-        escalationKeywords: [
-            'critical', 'production', 'urgent', 'security', 'breaking',
-            'architecture', 'refactor', 'redesign', 'root cause'
-        ],
-        simplificationKeywords: [
-            'find', 'list', 'show', 'where', 'search', 'locate', 'grep'
-        ]
-    },
-    // External models configuration (Codex, Gemini)
-    externalModels: {
-        defaults: {
-            codexModel: process.env.OMC_CODEX_DEFAULT_MODEL || 'gpt-5.3-codex',
-            geminiModel: process.env.OMC_GEMINI_DEFAULT_MODEL || 'gemini-3-pro-preview',
+        mcpServers: {
+            exa: { enabled: true },
+            context7: { enabled: true }
         },
-        fallbackPolicy: {
-            onModelFailure: 'provider_chain',
-            allowCrossProvider: false,
-            crossProviderOrder: ['codex', 'gemini'],
+        permissions: {
+            allowBash: true,
+            allowEdit: true,
+            allowWrite: true,
+            maxBackgroundTasks: 5
         },
-    },
-    // Delegation routing configuration (opt-in feature for external model routing)
-    delegationRouting: {
-        enabled: false, // Opt-in feature
-        defaultProvider: 'claude',
-        roles: {},
-    }
-};
+        magicKeywords: {
+            ultrawork: ['ultrawork', 'ulw', 'uw'],
+            search: ['search', 'find', 'locate'],
+            analyze: ['analyze', 'investigate', 'examine'],
+            ultrathink: ['ultrathink', 'think', 'reason', 'ponder']
+        },
+        // Intelligent model routing configuration
+        routing: {
+            enabled: true,
+            defaultTier: 'MEDIUM',
+            forceInherit: false,
+            escalationEnabled: true,
+            maxEscalations: 2,
+            tierModels: { ...defaultTierModels },
+            agentOverrides: {
+                architect: { tier: 'HIGH', reason: 'Advisory agent requires deep reasoning' },
+                planner: { tier: 'HIGH', reason: 'Strategic planning requires deep reasoning' },
+                critic: { tier: 'HIGH', reason: 'Critical review requires deep reasoning' },
+                analyst: { tier: 'HIGH', reason: 'Pre-planning analysis requires deep reasoning' },
+                explore: { tier: 'LOW', reason: 'Exploration is search-focused' },
+                'writer': { tier: 'LOW', reason: 'Documentation is straightforward' }
+            },
+            escalationKeywords: [
+                'critical', 'production', 'urgent', 'security', 'breaking',
+                'architecture', 'refactor', 'redesign', 'root cause'
+            ],
+            simplificationKeywords: [
+                'find', 'list', 'show', 'where', 'search', 'locate', 'grep'
+            ]
+        },
+        // External models configuration (Codex, Gemini)
+        // Static defaults only — env var overrides applied in loadEnvConfig()
+        externalModels: {
+            defaults: {
+                codexModel: BUILTIN_EXTERNAL_MODEL_DEFAULTS.codexModel,
+                geminiModel: BUILTIN_EXTERNAL_MODEL_DEFAULTS.geminiModel,
+            },
+            fallbackPolicy: {
+                onModelFailure: 'provider_chain',
+                allowCrossProvider: false,
+                crossProviderOrder: ['codex', 'gemini'],
+            },
+        },
+        // Delegation routing configuration (opt-in feature for external model routing)
+        delegationRouting: {
+            enabled: false,
+            defaultProvider: 'claude',
+            roles: {},
+        },
+        startupCodebaseMap: {
+            enabled: true,
+            maxFiles: 200,
+            maxDepth: 4,
+        },
+        taskSizeDetection: {
+            enabled: true,
+            smallWordLimit: 50,
+            largeWordLimit: 200,
+            suppressHeavyModesForSmallTasks: true,
+        },
+    };
+}
+export const DEFAULT_CONFIG = buildDefaultConfig();
 /**
  * Configuration file locations
  */
 export function getConfigPaths() {
     const userConfigDir = getConfigDir();
     return {
-        user: join(userConfigDir, 'claude-sisyphus', 'config.jsonc'),
-        project: join(process.cwd(), '.claude', 'sisyphus.jsonc')
+        user: join(userConfigDir, 'claude-omc', 'config.jsonc'),
+        project: join(process.cwd(), '.claude', 'omc.jsonc')
     };
 }
 /**
@@ -117,14 +145,7 @@ export function loadJsoncFile(path) {
     }
     try {
         const content = readFileSync(path, 'utf-8');
-        const errors = [];
-        const result = jsonc.parse(content, errors, {
-            allowTrailingComma: true,
-            allowEmptyContent: true
-        });
-        if (errors.length > 0) {
-            console.warn(`Warning: Parse errors in ${path}:`, errors);
-        }
+        const result = parseJsonc(content);
         return result;
     }
     catch (error) {
@@ -137,9 +158,10 @@ export function loadJsoncFile(path) {
  */
 export function deepMerge(target, source) {
     const result = { ...target };
+    const mutableResult = result;
     for (const key of Object.keys(source)) {
         const sourceValue = source[key];
-        const targetValue = result[key];
+        const targetValue = mutableResult[key];
         if (sourceValue !== undefined &&
             typeof sourceValue === 'object' &&
             sourceValue !== null &&
@@ -147,10 +169,10 @@ export function deepMerge(target, source) {
             typeof targetValue === 'object' &&
             targetValue !== null &&
             !Array.isArray(targetValue)) {
-            result[key] = deepMerge(targetValue, sourceValue);
+            mutableResult[key] = deepMerge(targetValue, sourceValue);
         }
         else if (sourceValue !== undefined) {
-            result[key] = sourceValue;
+            mutableResult[key] = sourceValue;
         }
     }
     return result;
@@ -196,6 +218,12 @@ export function loadEnvConfig() {
             enabled: process.env.OMC_ROUTING_ENABLED === 'true'
         };
     }
+    if (process.env.OMC_ROUTING_FORCE_INHERIT !== undefined) {
+        config.routing = {
+            ...config.routing,
+            forceInherit: process.env.OMC_ROUTING_FORCE_INHERIT === 'true'
+        };
+    }
     if (process.env.OMC_ROUTING_DEFAULT_TIER) {
         const tier = process.env.OMC_ROUTING_DEFAULT_TIER.toUpperCase();
         if (tier === 'LOW' || tier === 'MEDIUM' || tier === 'HIGH') {
@@ -204,6 +232,22 @@ export function loadEnvConfig() {
                 defaultTier: tier
             };
         }
+    }
+    // Model alias overrides from environment (issue #1211)
+    const aliasKeys = ['HAIKU', 'SONNET', 'OPUS'];
+    const modelAliases = {};
+    for (const key of aliasKeys) {
+        const envVal = process.env[`OMC_MODEL_ALIAS_${key}`];
+        if (envVal) {
+            const lower = key.toLowerCase();
+            modelAliases[lower] = envVal.toLowerCase();
+        }
+    }
+    if (Object.keys(modelAliases).length > 0) {
+        config.routing = {
+            ...config.routing,
+            modelAliases: modelAliases,
+        };
     }
     if (process.env.OMC_ESCALATION_ENABLED !== undefined) {
         config.routing = {
@@ -272,8 +316,8 @@ export function loadEnvConfig() {
  */
 export function loadConfig() {
     const paths = getConfigPaths();
-    // Start with defaults
-    let config = { ...DEFAULT_CONFIG };
+    // Start with fresh defaults so env-based model overrides are resolved at call time
+    let config = buildDefaultConfig();
     // Merge user config
     const userConfig = loadJsoncFile(paths.user);
     if (userConfig) {
@@ -287,7 +331,51 @@ export function loadConfig() {
     // Merge environment variables (highest precedence)
     const envConfig = loadEnvConfig();
     config = deepMerge(config, envConfig);
+    // Auto-enable forceInherit for non-standard providers (issues #1201, #1025)
+    // Only auto-enable if user hasn't explicitly set it via config or env var.
+    // Triggers for: CC Switch / LiteLLM (non-Claude model IDs), custom
+    // ANTHROPIC_BASE_URL, AWS Bedrock (CLAUDE_CODE_USE_BEDROCK=1), and
+    // Google Vertex AI (CLAUDE_CODE_USE_VERTEX=1). Passing Claude-specific
+    // tier names (sonnet/opus/haiku) causes 400 errors on these platforms.
+    if (config.routing?.forceInherit !== true &&
+        process.env.OMC_ROUTING_FORCE_INHERIT === undefined &&
+        isNonClaudeProvider()) {
+        config.routing = {
+            ...config.routing,
+            forceInherit: true,
+        };
+    }
     return config;
+}
+const OMC_STARTUP_COMPACTABLE_SECTIONS = [
+    'agent_catalog',
+    'skills',
+    'team_compositions',
+];
+function looksLikeOmcGuidance(content) {
+    return content.includes('<guidance_schema_contract>')
+        && /oh-my-(claudecode|codex)/i.test(content)
+        && OMC_STARTUP_COMPACTABLE_SECTIONS.some(section => content.includes(`<${section}>`) && content.includes(`</${section}>`));
+}
+export function compactOmcStartupGuidance(content) {
+    if (!looksLikeOmcGuidance(content)) {
+        return content;
+    }
+    let compacted = content;
+    let removedAny = false;
+    for (const section of OMC_STARTUP_COMPACTABLE_SECTIONS) {
+        const pattern = new RegExp(`\n*<${section}>[\\s\\S]*?<\/${section}>\n*`, 'g');
+        const next = compacted.replace(pattern, '\n\n');
+        removedAny = removedAny || next !== compacted;
+        compacted = next;
+    }
+    if (!removedAny) {
+        return content;
+    }
+    return compacted
+        .replace(/\n{3,}/g, '\n\n')
+        .replace(/\n\n---\n\n---\n\n/g, '\n\n---\n\n')
+        .trim();
 }
 /**
  * Find and load AGENTS.md or CLAUDE.md files for context injection
@@ -327,7 +415,7 @@ export function loadContextFromFiles(files) {
     const contexts = [];
     for (const file of files) {
         try {
-            const content = readFileSync(file, 'utf-8');
+            const content = compactOmcStartupGuidance(readFileSync(file, 'utf-8'));
             contexts.push(`## Context from ${file}\n\n${content}`);
         }
         catch (error) {
@@ -342,54 +430,90 @@ export function loadContextFromFiles(files) {
 export function generateConfigSchema() {
     return {
         $schema: 'http://json-schema.org/draft-07/schema#',
-        title: 'Oh-My-Claude-Sisyphus Configuration',
+        title: 'Oh-My-ClaudeCode Configuration',
         type: 'object',
         properties: {
             agents: {
                 type: 'object',
                 description: 'Agent model and feature configuration',
                 properties: {
-                    sisyphus: {
+                    omc: {
                         type: 'object',
                         properties: {
                             model: { type: 'string', description: 'Model ID for the main orchestrator' }
                         }
                     },
-                    architect: {
-                        type: 'object',
-                        properties: {
-                            model: { type: 'string' },
-                            enabled: { type: 'boolean' }
-                        }
-                    },
-                    researcher: {
-                        type: 'object',
-                        properties: { model: { type: 'string' } }
-                    },
                     explore: {
                         type: 'object',
                         properties: { model: { type: 'string' } }
                     },
-                    frontendEngineer: {
+                    analyst: {
                         type: 'object',
-                        properties: {
-                            model: { type: 'string' },
-                            enabled: { type: 'boolean' }
-                        }
+                        properties: { model: { type: 'string' } }
                     },
-                    documentWriter: {
+                    planner: {
                         type: 'object',
-                        properties: {
-                            model: { type: 'string' },
-                            enabled: { type: 'boolean' }
-                        }
+                        properties: { model: { type: 'string' } }
                     },
-                    multimodalLooker: {
+                    architect: {
                         type: 'object',
-                        properties: {
-                            model: { type: 'string' },
-                            enabled: { type: 'boolean' }
-                        }
+                        properties: { model: { type: 'string' } }
+                    },
+                    debugger: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
+                    },
+                    executor: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
+                    },
+                    verifier: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
+                    },
+                    securityReviewer: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
+                    },
+                    codeReviewer: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
+                    },
+                    testEngineer: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
+                    },
+                    designer: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
+                    },
+                    writer: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
+                    },
+                    qaTester: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
+                    },
+                    scientist: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
+                    },
+                    gitMaster: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
+                    },
+                    codeSimplifier: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
+                    },
+                    critic: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
+                    },
+                    documentSpecialist: {
+                        type: 'object',
+                        properties: { model: { type: 'string' } }
                     }
                 }
             },
@@ -441,14 +565,13 @@ export function generateConfigSchema() {
                     ultrathink: { type: 'array', items: { type: 'string' } }
                 }
             },
-            swarm: {
+            routing: {
                 type: 'object',
-                description: 'Swarm mode settings',
+                description: 'Intelligent model routing configuration',
                 properties: {
-                    defaultMaxConcurrent: { type: 'integer', default: 5, minimum: 1, maximum: 50 },
-                    wavePollingInterval: { type: 'integer', default: 5000, minimum: 1000, maximum: 30000 },
-                    aggressiveThreshold: { type: 'integer', default: 5 },
-                    enableFileOwnership: { type: 'boolean', default: true }
+                    enabled: { type: 'boolean', default: true, description: 'Enable intelligent model routing' },
+                    defaultTier: { type: 'string', enum: ['LOW', 'MEDIUM', 'HIGH'], default: 'MEDIUM', description: 'Default tier when no rules match' },
+                    forceInherit: { type: 'boolean', default: false, description: 'Force all agents to inherit the parent model, bypassing OMC model routing. When true, no model parameter is passed to Task calls, so agents use the user\'s Claude Code model setting. Auto-enabled for non-Claude providers (CC Switch, custom ANTHROPIC_BASE_URL), AWS Bedrock, and Google Vertex AI.' },
                 }
             },
             externalModels: {
@@ -466,12 +589,12 @@ export function generateConfigSchema() {
                             },
                             codexModel: {
                                 type: 'string',
-                                default: 'gpt-5.3-codex',
+                                default: BUILTIN_EXTERNAL_MODEL_DEFAULTS.codexModel,
                                 description: 'Default Codex model'
                             },
                             geminiModel: {
                                 type: 'string',
-                                default: 'gemini-3-pro-preview',
+                                default: BUILTIN_EXTERNAL_MODEL_DEFAULTS.geminiModel,
                                 description: 'Default Gemini model'
                             }
                         }
@@ -547,7 +670,7 @@ export function generateConfigSchema() {
                             type: 'object',
                             properties: {
                                 provider: { type: 'string', enum: ['claude', 'codex', 'gemini'] },
-                                tool: { type: 'string', enum: ['Task', 'ask_codex', 'ask_gemini'] },
+                                tool: { type: 'string', enum: ['Task'] },
                                 model: { type: 'string' },
                                 agentType: { type: 'string' },
                                 fallback: { type: 'array', items: { type: 'string' } }
